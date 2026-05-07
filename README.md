@@ -28,7 +28,7 @@ audio/groupB/recording_02.wav,GroupB,233.08
 
 - **path**: absolute or relative path to the audio file
 - **group**: label string — must match `--label-a` / `--label-b` exactly
-- **tonic**: tonic frequency in Hz (e.g. D4 = 293.66)
+- **tonic**: tonic frequency in Hz (e.g. `293.66`) **or** a note name string (e.g. `A`, `F#`, `Bb`). Note names are resolved to the third octave (C3 = 130.81 Hz). Enharmonic aliases (`Db`, `Eb`, `Gb`, `Ab`, `Bb`) are accepted.
 
 The `tonic` column is optional. If it is absent or a cell is empty, the pipeline falls back to a `_tonic.txt` sidecar file at the same path as the audio (containing a single float in Hz). Having the tonic in the manifest is generally preferable as it keeps all metadata in one place.
 
