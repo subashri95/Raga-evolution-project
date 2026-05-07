@@ -1,5 +1,5 @@
 matplotlib
 numpy
 scipy
-compiam
+compiam[essentia]
 Click
