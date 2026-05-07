@@ -1,0 +1,25 @@
+hypotheses:
+  - svara: D1
+    metric: peak_height
+    comparison: Group1 > Group2
+    label: "D1 more prominent in Group 1"
+
+  - svara: D1
+    metric: offset_cents
+    comparison: Group1 != Group2
+    label: "D1 intonation differs between groups"
+
+  - svara: G3
+    metric: offset_cents
+    comparison: Group1 < Group2
+    label: "G3 flatter in Group 1"
+
+  - svara: M1
+    metric: peak_width
+    comparison: Group1 > Group2
+    label: "M1 wider (more gamaka) in Group 1"
+
+  - svara: S
+    metric: peak_height
+    comparison: Group1 != Group2
+    label: "Sa prominence differs between groups"

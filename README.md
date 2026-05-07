@@ -56,6 +56,12 @@ python main.py run manifest.csv --groups GroupA --groups GroupB --output report.
 
 Open `report.html` in any browser. The file is fully self-contained (all figures are base64-encoded inline).
 
+To include focused hypothesis tests (see below):
+
+```bash
+python main.py run manifest.csv --hypotheses hypotheses.yaml --output report.html
+```
+
 ### Options
 
 | Flag | Default | Description |
@@ -63,6 +69,42 @@ Open `report.html` in any browser. The file is fully self-contained (all figures
 | `--groups` / `-g` | all groups | Repeat to restrict to a subset of manifest groups |
 | `--output` | `report.html` | Output HTML path |
 | `--alpha` | `0.05` | Family-wise error rate for Bonferroni correction |
+| `--hypotheses` | *(none)* | Path to a YAML hypotheses file (optional) |
+
+## Focused hypotheses
+
+When you have specific musicological questions — e.g. *"is D1 more prominent in Group 1 than Group 2?"* — state them in a YAML file instead of relying on the exploratory sweep. This matters statistically: the Bonferroni correction divides by the number of hypotheses you actually state, not by 72 (12 svaras × 6 metrics). With 5 hypotheses the corrected threshold is 0.010 instead of 0.0007, giving substantially more power.
+
+### Hypotheses file format
+
+```yaml
+hypotheses:
+  - svara: D1
+    metric: peak_height
+    comparison: Group1 > Group2
+    label: "D1 more prominent in Group 1"
+
+  - svara: G3
+    metric: offset_cents
+    comparison: Group1 < Group2
+    label: "G3 flatter in Group 1"
+
+  - svara: M1
+    metric: peak_width
+    comparison: Group1 != Group2
+    label: "M1 gamaka intensity differs"
+```
+
+| Field | Required | Values |
+|-------|----------|--------|
+| `svara` | yes | `S` `R1` `R2/G1` `R3/G2` `G3` `M1` `M2` `P` `D1` `D2/N1` `N2/D3` `N3` |
+| `metric` | yes | `peak_loc` · `offset_cents` · `peak_height` · `peak_width` · `skewness` · `kurtosis` |
+| `comparison` | yes | `GroupA > GroupB` · `GroupA < GroupB` · `GroupA != GroupB` |
+| `label` | no | human-readable description (defaults to the comparison string) |
+
+**Directional hypotheses** (`>` / `<`) use a one-sided Mann-Whitney U test, which halves the p-value relative to two-sided when the direction is correct. Only use these when you have a genuine prior prediction — stating a direction after seeing the data inflates the false-positive rate.
+
+Results appear in **Section 8** of the report with their own Bonferroni-corrected p-values and effect sizes.
 
 ## Report structure
 
@@ -75,6 +117,8 @@ Open `report.html` in any browser. The file is fully self-contained (all figures
 | 5. Pairwise comparisons | MWU post-hoc for every pair of groups |
 | 6. Per-metric boxplots | One figure per metric, all groups side by side |
 | 7. Full per-svara tables | Omnibus + all pairwise results with effect sizes |
+| 8. Focused hypotheses | *(only present when `--hypotheses` is supplied)* Per-hypothesis MWU results with focused Bonferroni correction |
+| 9. Individual histograms | Collapsible — KDE + pitch histogram for every recording |
 
 ## Statistical approach
 
@@ -94,7 +138,7 @@ Each svara peak is characterised by six descriptors. All six are computed indepe
 
 ### Peak location (cents from tonic)
 
-The position of the KDE mode within the ±50-cent window around each equal-temperament svara position. In Indian art music, svaras do not sit at fixed equal-temperament frequencies; each rāga prescribes its own characteristic intonation for each svara (*śruti*). A systematic shift in peak location between groups therefore reflects a difference in the characteristic intonation of that svara — for example, one group habitually singing a slightly flatter Gāndhāra. This is one of the most direct quantitative correlates of rāga grammar.
+The position of the KDE mode within the ±50-cent window around each equal-temperament svara position. In Indian art music, svaras do not sit at fixed equal-temperament frequencies; each rāga prescribes its own characteristic intonation for each svara. A systematic shift in peak location between groups therefore reflects a difference in the characteristic intonation of that svara — for example, one group habitually singing a slightly flatter Gāndhāra. This is one of the most direct quantitative correlates of rāga grammar.
 
 ### Intonation offset from ET (cents)
 

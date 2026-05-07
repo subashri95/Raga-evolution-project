@@ -28,10 +28,13 @@ import csv
 import io
 import logging
 import os
+import re
 import time
 import warnings
 from collections import defaultdict
 from itertools import combinations
+
+import yaml
 
 warnings.filterwarnings("ignore")
 
@@ -539,27 +542,21 @@ def _interpret(svara: str, metric: str, mean_a: float, mean_b: float,
         sharp, flat, d = (label_a, label_b, -delta) if delta < 0 else (label_b, label_a, delta)
         if d < 5:
             return (f"The intonation of {svara} is nearly identical between groups "
-                    f"(difference &lt; 5 cents). No meaningful śruti divergence.")
+                    f"(difference &lt; 5 cents). No meaningful divergence.")
         elif d < 20:
             return (f"{sharp} sings {svara} approximately {d:.1f} cents sharper than {flat}. "
                     f"Differences of this scale are perceptible to trained listeners and may "
-                    f"reflect a distinct śruti preference, school tradition (paramparā), or "
-                    f"rāga-specific intonation practice.")
+                    f"reflect a distinct intonation preference.")
         else:
             return (f"A substantial divergence of {d:.1f} cents: {sharp} places {svara} "
                     f"markedly higher than {flat}. This is musicologically significant — "
-                    f"differences above ~20 cents constitute a genuine difference in svara "
-                    f"identity and are characteristic of distinct performance lineages or "
-                    f"rāga interpretations.")
+                    f"differences above ~20 cents constitute a genuine difference in svara.")
 
     elif metric == "peak_height":
         d_pct = 100.0 * abs(delta) / max(mean_a, mean_b)
         return (f"{higher} spends proportionally more time on {svara} "
                 f"({d_pct:.0f}% higher relative density). "
-                f"This suggests {svara} carries greater melodic weight in {higher}'s rendition — "
-                f"consistent with a more prominent vādi, samvādi, or dīrgha svara function. "
-                f"In {lower}'s performance, {svara} appears to fulfil a more transitional or "
-                f"alpa role.")
+                f"This suggests {svara} carries greater melodic weight in {higher}'s rendition")
 
     elif metric == "peak_width":
         wider    = label_a if mean_a > mean_b else label_b
@@ -568,10 +565,9 @@ def _interpret(svara: str, metric: str, mean_a: float, mean_b: float,
         w_narrow = min(mean_a, mean_b)
         return (f"{wider} shows greater pitch spread around {svara} "
                 f"(FWHM {w_wide:.0f} vs {w_narrow:.0f} cents). "
-                f"This is consistent with heavier or more elaborate gamaka usage — oscillatory, "
-                f"sliding, or shaking ornaments that widen the pitch distribution. "
+                f"This is consistent with heavier or more elaborate gamaka usage."
                 f"{narrower} treats {svara} more steadily, suggesting either sparser ornamentation "
-                f"or a more anchored, khaṇḍa-based style.")
+                f"or a more anchored style.")
 
     elif metric == "skewness":
         if abs(delta) < 0.15:
@@ -581,9 +577,9 @@ def _interpret(svara: str, metric: str, mean_a: float, mean_b: float,
         neg_grp = label_b if mean_a > mean_b else label_a
         return (f"{pos_grp} shows a more positively skewed pitch distribution around {svara}, "
                 f"indicating a tendency to linger on pitches above the nominal position or "
-                f"approach from below — characteristic of an ascending (ārohana) gamaka character. "
+                f"approach from below — characteristic of an ascending gamaka character. "
                 f"{neg_grp} leans toward pitches below the nominal pitch, reflecting a more "
-                f"descending (avarohana) approach or a downward meend/jāru tendency.")
+                f"descending approach or a downward tendency.")
 
     elif metric == "kurtosis":
         if abs(delta) < 0.2:
@@ -594,9 +590,7 @@ def _interpret(svara: str, metric: str, mean_a: float, mean_b: float,
         return (f"{peaked} shows higher kurtosis on {svara}: pitch values cluster tightly around "
                 f"the nominal position with occasional brief excursions. This is characteristic of "
                 f"a sustained, anchored svara — possibly with sparse, precise gamaka. "
-                f"{spread}'s flatter distribution suggests dense, continuous ornamentation such as "
-                f"kampita (oscillation) or jāru (glide), where the pitch rarely settles on a "
-                f"single point.")
+                f"{spread}'s flatter distribution suggests dense, continuous ornamentation")
 
     elif metric == "peak_loc":
         return (f"The modal pitch of {svara} differs by {abs(delta):.1f} cents between groups, "
@@ -647,13 +641,13 @@ def fig_kde_overlay(all_kde: dict, all_cents: dict) -> object:
         counts, _ = np.histogram(pooled, bins=bin_edges)
         density   = counts / (counts.sum() * bin_w)
         ax.bar(bin_ctrs, density, width=bin_w * 0.9,
-               color=colors[label], alpha=0.10, zorder=1)
+               color=colors[label], alpha=0.04, zorder=1)
 
     # --- Per-recording traces (thin, translucent) ---
     for label, kde_list in sorted(all_kde.items()):
         x = kde_list[0][0]
         for x_i, y_i in kde_list:
-            ax.plot(x_i, y_i, color=colors[label], lw=0.6, alpha=0.18, zorder=2)
+            ax.plot(x_i, y_i, color=colors[label], lw=0.5, alpha=0.06, zorder=2)
 
     # --- Mean ± 1 SD ---
     for label, kde_list in sorted(all_kde.items()):
@@ -670,6 +664,28 @@ def fig_kde_overlay(all_kde: dict, all_cents: dict) -> object:
     ax.set_ylabel("Density")
     ax.set_title("Pitch-class distribution by group  (mean KDE ± 1 SD · faint: individual recordings · bars: pooled histogram)")
     ax.legend()
+    plt.tight_layout()
+    return fig
+
+
+def fig_individual_kde(label: str, recording_name: str, x: np.ndarray,
+                       y: np.ndarray, cents: np.ndarray, color: str) -> object:
+    """Single-recording KDE with histogram background."""
+    _apply_plot_style()
+    fig, ax = plt.subplots(figsize=(14, 3.2))
+
+    bin_edges = np.linspace(0, 1200, 121)
+    bin_w     = bin_edges[1] - bin_edges[0]
+    bin_ctrs  = (bin_edges[:-1] + bin_edges[1:]) / 2
+    counts, _ = np.histogram(cents, bins=bin_edges)
+    density   = counts / (counts.sum() * bin_w)
+    ax.bar(bin_ctrs, density, width=bin_w * 0.9, color=color, alpha=0.25, zorder=1)
+    ax.plot(x, y, color=color, lw=1.8, zorder=2)
+
+    _svara_axis(ax)
+    ax.set_xlabel("Cents from tonic")
+    ax.set_ylabel("Density")
+    ax.set_title(f"{label} — {recording_name}")
     plt.tight_layout()
     return fig
 
@@ -829,6 +845,15 @@ details summary { cursor: pointer; color: #2d5a8a; font-size: 0.88rem; }
 .svara-block { border: 1px solid #dde3ec; border-radius: 6px; padding: 1rem 1.2rem; margin-bottom: 1.5rem; }
 .svara-block h3 { margin-top: 0; }
 .tbl-label { font-size: 0.78rem; color: #666; margin: 0.6rem 0 0.2rem 0; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.sec-collapsible > summary { list-style: none; padding: 0.5rem 0; }
+.sec-collapsible > summary::-webkit-details-marker { display: none; }
+.sec-collapsible > summary h2 { color: #2d5a8a; margin: 0; }
+.sec-collapsible > summary::before { content: "▶ "; font-size: 0.8rem; color: #999; }
+.sec-collapsible[open] > summary::before { content: "▼ "; }
+.ind-group { border: 1px solid #e4e8f0; border-radius: 6px; padding: 0.6rem 1rem; margin: 0.6rem 0; }
+.ind-group > summary { font-size: 0.92rem; color: #444; padding: 0.3rem 0; }
+.ind-kde { margin: 0.8rem 0; }
+.ind-kde img { width: 100%; max-width: 1000px; display: block; }
 """
 
 
@@ -862,6 +887,7 @@ def build_report(
     n_tests_omnibus:  int,
     n_tests_pairwise: int,
     alpha: float = 0.05,
+    hypothesis_results: list | None = None,
 ) -> str:
     labels = sorted(all_peaks.keys())
     pairs  = list(combinations(labels, 2))
@@ -1150,15 +1176,192 @@ def build_report(
         + "".join(svara_blocks)
     )
 
+    # ---- Section 8: Focused hypotheses -------------------------------------
+    sec8 = None
+    if hypothesis_results:
+        n_hyp    = len(hypothesis_results)
+        n_sig    = sum(r["significant"] for r in hypothesis_results)
+        corr_thr = alpha / n_hyp
+        rows = ""
+        for r in hypothesis_results:
+            sig_cell = '<span class="pill">sig</span>' if r["significant"] else ""
+            direction_str = {"greater": "one-sided &gt;", "less": "one-sided &lt;",
+                             "two-sided": "two-sided"}[r["alternative"]]
+            rows += (
+                f"<tr class='{'sig-row' if r['significant'] else ''}'>"
+                f"<td>{r['label']}</td>"
+                f"<td>{r['svara']}</td>"
+                f"<td>{METRIC_LABELS.get(r['metric'], r['metric'])}</td>"
+                f"<td>{r['group_a']} {r['op']} {r['group_b']}</td>"
+                f"<td>{direction_str}</td>"
+                f"<td>{r['n_a']}</td><td>{r['n_b']}</td>"
+                f"<td>{_fmt(r['mean_a'])}</td><td>{_fmt(r['mean_b'])}</td>"
+                f"<td>{_fmt(r['p_raw'], 4)}</td>"
+                f"<td>{_fmt(r['p_bonferroni'], 4)}</td>"
+                f"<td>{_fmt(r['effect_r'])}</td>"
+                f"<td>{sig_cell}</td>"
+                f"</tr>"
+            )
+        header = (
+            "<tr><th>Hypothesis</th><th>Svara</th><th>Metric</th>"
+            "<th>Comparison</th><th>Test</th>"
+            "<th>n A</th><th>n B</th>"
+            "<th>Mean A</th><th>Mean B</th>"
+            "<th>p (raw)</th><th>p (Bonferroni)</th>"
+            "<th>Effect r</th><th></th></tr>"
+        )
+        sec8 = _section(
+            "<h2>8. Focused hypotheses</h2>"
+            f"<p>{n_hyp} hypothesis/hypotheses stated. "
+            f"Bonferroni denominator: {n_hyp} · "
+            f"Corrected threshold: {corr_thr:.4f} · "
+            f"Significant: {n_sig} / {n_hyp}.</p>"
+            f"<p class='note'>One-sided tests are used where a direction (&gt; or &lt;) "
+            "is specified, providing greater power than two-sided tests when the "
+            "direction of effect is predicted in advance.</p>"
+            f"<table>{header}{rows}</table>"
+        )
+
+    # ---- Section 9: Individual performance histograms ----------------------
+    colors = _group_colors(labels)
+    ind_blocks = []
+    for label in labels:
+        recording_imgs = []
+        for path, (x, y), cents in zip(
+            all_paths[label], all_kde[label], all_cents[label]
+        ):
+            name = os.path.basename(path)
+            fig  = fig_individual_kde(label, name, x, y, cents, colors[label])
+            recording_imgs.append(
+                f"<div class='ind-kde'>{_img(_b64(fig))}</div>"
+            )
+            plt.close(fig)
+        group_html = (
+            f"<details class='ind-group'>"
+            f"<summary><strong>{label}</strong> — {len(recording_imgs)} recording(s)</summary>"
+            + "".join(recording_imgs)
+            + "</details>"
+        )
+        ind_blocks.append(group_html)
+
+    sec9 = _section(
+        "<details class='sec-collapsible'>"
+        "<summary><h2 style='display:inline'>9. Individual performance histograms</h2></summary>"
+        "<p>KDE and pitch histogram for each recording, grouped by group. "
+        "Expand a group to scroll through its recordings.</p>"
+        + "".join(ind_blocks)
+        + "</details>"
+    )
+
+    sections = [sec1, sec2, sec3, sec4, sec5, sec6, sec7]
+    if sec8:
+        sections.append(sec8)
+    sections.append(sec9)
+
     return "\n".join([
         "<!DOCTYPE html><html lang='en'>",
         "<head><meta charset='UTF-8'>",
         f"<title>Intonation Report — {', '.join(labels)}</title>",
         f"<style>{_CSS}</style></head><body>",
         f"<h1>Intonation Analysis: {' · '.join(labels)}</h1>",
-        sec1, sec2, sec3, sec4, sec5, sec6, sec7,
+        *sections,
         "</body></html>",
     ])
+
+
+# ---------------------------------------------------------------------------
+# Focused hypothesis testing
+# ---------------------------------------------------------------------------
+
+_COMPARISON_RE = re.compile(
+    r"^\s*(.+?)\s*(>|<|!=)\s*(.+?)\s*$"
+)
+
+def load_hypotheses(path: str) -> list:
+    """
+    Parse a YAML hypotheses file.  Each entry must have:
+        svara      : svara name matching SVARA_NAMES (e.g. "D1")
+        metric     : one of peak_loc, offset_cents, peak_height,
+                     peak_width, skewness, kurtosis
+        comparison : "GroupA > GroupB" | "GroupA < GroupB" | "GroupA != GroupB"
+        label      : human-readable description (optional)
+    """
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    raw = data.get("hypotheses", [])
+    parsed = []
+    for i, h in enumerate(raw, 1):
+        m = _COMPARISON_RE.match(h.get("comparison", ""))
+        if not m:
+            raise ValueError(
+                f"Hypothesis {i}: cannot parse comparison '{h.get('comparison')}'. "
+                "Expected 'GroupA > GroupB', 'GroupA < GroupB', or 'GroupA != GroupB'."
+            )
+        group_a, op, group_b = m.group(1), m.group(2), m.group(3)
+        svara  = h.get("svara", "").strip()
+        metric = h.get("metric", "").strip()
+        if svara not in SVARA_NAMES:
+            raise ValueError(
+                f"Hypothesis {i}: unknown svara '{svara}'. "
+                f"Valid names: {SVARA_NAMES}"
+            )
+        if metric not in METRICS:
+            raise ValueError(
+                f"Hypothesis {i}: unknown metric '{metric}'. "
+                f"Valid metrics: {METRICS}"
+            )
+        alternative = {">" : "greater", "<": "less", "!=": "two-sided"}[op]
+        parsed.append({
+            "svara":       svara,
+            "metric":      metric,
+            "group_a":     group_a,
+            "group_b":     group_b,
+            "op":          op,
+            "alternative": alternative,
+            "label":       h.get("label", f"{svara} {metric}: {group_a} {op} {group_b}"),
+        })
+    return parsed
+
+
+def test_hypotheses(hypotheses: list, all_peaks: dict, alpha: float = 0.05) -> list:
+    """
+    Run one MWU test per hypothesis with Bonferroni correction over
+    only the stated hypotheses (denominator = len(hypotheses)).
+    Returns a list of result dicts, one per hypothesis.
+    """
+    n = len(hypotheses)
+    results = []
+    for h in hypotheses:
+        vals_a = _collect_metric(all_peaks.get(h["group_a"], []), h["svara"], h["metric"])
+        vals_b = _collect_metric(all_peaks.get(h["group_b"], []), h["svara"], h["metric"])
+        result = {**h, "p_raw": float("nan"), "p_bonferroni": float("nan"),
+                  "significant": False, "effect_r": float("nan"),
+                  "n_a": len(vals_a), "n_b": len(vals_b),
+                  "mean_a": float(np.mean(vals_a)) if vals_a else float("nan"),
+                  "mean_b": float(np.mean(vals_b)) if vals_b else float("nan")}
+        if len(vals_a) >= 1 and len(vals_b) >= 1:
+            try:
+                stat, p = mannwhitneyu(vals_a, vals_b, alternative=h["alternative"])
+                r      = 1.0 - (2.0 * stat) / (len(vals_a) * len(vals_b))
+                p_bonf = min(p * n, 1.0)
+                result.update({
+                    "p_raw":        float(p),
+                    "p_bonferroni": p_bonf,
+                    "significant":  p_bonf < alpha,
+                    "effect_r":     float(r),
+                })
+            except ValueError:
+                pass
+        results.append(result)
+        log.info(
+            "Hypothesis '%s': p_raw=%.4f  p_bonf=%.4f  r=%.3f  %s",
+            result["label"],
+            result["p_raw"] if not np.isnan(result["p_raw"]) else float("nan"),
+            result["p_bonferroni"] if not np.isnan(result["p_bonferroni"]) else float("nan"),
+            result["effect_r"] if not np.isnan(result["effect_r"]) else float("nan"),
+            "SIGNIFICANT" if result["significant"] else "n.s.",
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1195,8 +1398,11 @@ def extract(ctx, audio_paths):
 @click.option("--output", default="report.html", show_default=True)
 @click.option("--alpha", default=0.05, show_default=True,
               help="Family-wise error rate for Bonferroni correction.")
+@click.option("--hypotheses", "hypotheses_path", default=None,
+              type=click.Path(exists=True),
+              help="YAML file of focused hypotheses (optional).")
 @click.pass_context
-def run(ctx, manifest, groups, output, alpha):
+def run(ctx, manifest, groups, output, alpha, hypotheses_path):
     """
     Full pipeline: process all groups in MANIFEST, compare them, write HTML report.
 
@@ -1249,6 +1455,12 @@ def run(ctx, manifest, groups, output, alpha):
         all_peaks[label]  = peaks_list
         log.info("Group '%s' done", label)
 
+    hypotheses = []
+    if hypotheses_path:
+        log.info("Loading hypotheses: %s", hypotheses_path)
+        hypotheses = load_hypotheses(hypotheses_path)
+        log.info("%d hypothesis/hypotheses loaded", len(hypotheses))
+
     log.info("Running statistical comparison...")
     omnibus, pairwise, n_peaks_omni, n_peaks_pair, n_tests_omni, n_tests_pair = \
         compare_groups(all_peaks, alpha=alpha)
@@ -1265,6 +1477,13 @@ def run(ctx, manifest, groups, output, alpha):
     log.info("Omnibus significant:  %d / %d", n_sig_omni, n_tests_omni)
     log.info("Pairwise significant: %d / %d", n_sig_pair, n_tests_pair)
 
+    hypothesis_results = None
+    if hypotheses:
+        log.info("Testing %d focused hypothesis/hypotheses...", len(hypotheses))
+        hypothesis_results = test_hypotheses(hypotheses, all_peaks, alpha=alpha)
+        n_sig_hyp = sum(r["significant"] for r in hypothesis_results)
+        log.info("Focused hypotheses significant: %d / %d", n_sig_hyp, len(hypotheses))
+
     log.info("Building report → %s", output)
     html = build_report(
         all_paths, all_kde, all_cents, all_peaks,
@@ -1272,6 +1491,7 @@ def run(ctx, manifest, groups, output, alpha):
         n_peaks_omni, n_peaks_pair,
         n_tests_omni, n_tests_pair,
         alpha=alpha,
+        hypothesis_results=hypothesis_results,
     )
     with open(output, "w", encoding="utf-8") as f:
         f.write(html)

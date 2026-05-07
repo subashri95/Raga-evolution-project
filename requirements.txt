@@ -3,3 +3,4 @@ numpy
 scipy
 compiam[essentia]
 Click
+PyYAML
