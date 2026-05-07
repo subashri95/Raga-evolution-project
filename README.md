@@ -62,7 +62,35 @@ To include focused hypothesis tests (see below):
 python main.py run manifest.csv --hypotheses hypotheses.yaml --output report.html
 ```
 
-### Options
+### Extract features for ML pipeline
+
+```bash
+python main.py features manifest.csv features.csv
+```
+
+Processes every recording in the manifest and writes a flat CSV where each row is one recording and each column is a pitch histogram feature. This is the starting point for any downstream machine-learning pipeline.
+
+```bash
+# Restrict to specific groups
+python main.py features manifest.csv features.csv --groups GroupA --groups GroupB
+```
+
+**Output columns:**
+
+| Column | Description |
+|--------|-------------|
+| `filename` | Path from the manifest |
+| `group` | Group label from the manifest |
+| `<svara>_peak_loc` | Peak location (cents from tonic) for each of the 12 svaras |
+| `<svara>_offset_cents` | Intonation offset from equal temperament |
+| `<svara>_peak_height` | Peak height (density) |
+| `<svara>_peak_width` | Peak width / FWHM (cents) |
+| `<svara>_skewness` | Skewness of the pitch distribution |
+| `<svara>_kurtosis` | Excess kurtosis of the pitch distribution |
+
+72 feature columns in total (12 svaras × 6 metrics). Cells are `NaN` when a svara peak is not detected in a recording.
+
+### Run the full comparison pipeline options
 
 | Flag | Default | Description |
 |------|---------|-------------|

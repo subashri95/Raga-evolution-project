@@ -34,6 +34,8 @@ import warnings
 from collections import defaultdict
 from itertools import combinations
 
+import pandas as pd
+
 import yaml
 
 warnings.filterwarnings("ignore")
@@ -1499,6 +1501,79 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path):
     size_kb = os.path.getsize(output) / 1024
     log.info("Report written: %s (%.1f KB)", output, size_kb)
     log.info("Total time: %.1fs", time.time() - t_start)
+
+
+@cli.command()
+@click.argument("manifest", type=click.Path(exists=True))
+@click.argument("output", type=click.Path())
+@click.option("--groups", "-g", multiple=True,
+              help="Subset of group labels to include (default: all groups in manifest).")
+@click.pass_context
+def features(ctx, manifest, output, groups):
+    """
+    Extract pitch histogram features for every composition in MANIFEST and save
+    to OUTPUT (CSV).
+
+    \b
+    Each row corresponds to one recording. Columns:
+      filename  — path from the manifest
+      group     — group label from the manifest
+      <svara>_<metric>  — 12 svaras × 6 metrics = 72 feature columns
+                          (NaN when a svara peak is not detected)
+
+    Metrics: peak_loc, offset_cents, peak_height, peak_width, skewness, kurtosis
+    """
+    log.info("Loading manifest: %s", manifest)
+    all_groups = load_manifest(manifest)
+
+    if groups:
+        missing = [g for g in groups if g not in all_groups]
+        if missing:
+            raise click.UsageError(
+                f"Requested groups not in manifest: {missing}. "
+                f"Available: {sorted(all_groups.keys())}"
+            )
+        selected = {g: all_groups[g] for g in groups}
+    else:
+        selected = all_groups
+
+    columns = ["filename", "group"] + [
+        f"{svara}_{metric}"
+        for svara in SVARA_NAMES
+        for metric in METRICS
+    ]
+    rows = []
+
+    for label, entries in sorted(selected.items()):
+        log.info("--- Processing group '%s' (%d file(s)) ---", label, len(entries))
+        for i, entry in enumerate(entries, 1):
+            path = entry["path"]
+            log.info("[%d/%d] %s", i, len(entries), path)
+            try:
+                _, _, svara_stats, _ = analyse_file(path, tonic=entry["tonic"])
+            except Exception as exc:
+                log.warning("Skipping %s — %s", path, exc)
+                row = {"filename": path, "group": label}
+                for svara in SVARA_NAMES:
+                    for metric in METRICS:
+                        row[f"{svara}_{metric}"] = float("nan")
+                rows.append(row)
+                continue
+
+            row = {"filename": path, "group": label}
+            for svara in SVARA_NAMES:
+                stats = svara_stats.get(svara)
+                for metric in METRICS:
+                    if stats is None or not stats.get("present", False):
+                        row[f"{svara}_{metric}"] = float("nan")
+                    else:
+                        val = stats.get(metric, float("nan"))
+                        row[f"{svara}_{metric}"] = val if not isinstance(val, bool) else float("nan")
+            rows.append(row)
+
+    df = pd.DataFrame(rows, columns=columns)
+    df.to_csv(output, index=False)
+    log.info("Features saved: %s  (%d rows × %d columns)", output, len(df), len(df.columns))
 
 
 if __name__ == "__main__":
