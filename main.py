@@ -80,10 +80,10 @@ SVARA_NAMES = [
 ]
 
 WINDOW_CENTS = 50
-KDE_BW       = 0.03   # reduced from 0.075 for sharper svara peaks
+KDE_BW       = 0.018  # sharper peaks → easier find_peaks detection at low density
 KDE_N_POINTS = 1200
 
-PRESENCE_FACTOR    = 1.5
+PRESENCE_FACTOR    = 1.0
 PRESENCE_THRESHOLD = PRESENCE_FACTOR / 1200.0
 
 METRICS = [
@@ -239,28 +239,26 @@ def analyse_file(audio_path: str, tonic: float | None = None) -> tuple:
     log.debug("Computing KDE (bw=%.3f, %d points)", KDE_BW, KDE_N_POINTS)
     x, y = compute_kde(cents)
 
+    # Find all global KDE peaks via derivative sign change (+ → −)
+    dy = np.diff(y)
+    global_peak_idxs = np.where((dy[:-1] >= 0) & (dy[1:] < 0))[0] + 1
+
     svara_stats: dict = {}
     for svara, name in zip(SVARA_GRID, SVARA_NAMES):
-        kde_mask = (x >= svara - WINDOW_CENTS) & (x <= svara + WINDOW_CENTS)
-        if not np.any(kde_mask):
+        # Global peaks that fall within this svara's window
+        in_window = global_peak_idxs[
+            (x[global_peak_idxs] >= svara - WINDOW_CENTS) &
+            (x[global_peak_idxs] <= svara + WINDOW_CENTS)
+        ]
+        if len(in_window) == 0:
             svara_stats[name] = None
             continue
+        # Take the tallest peak in the window
+        idx_max     = in_window[int(np.argmax(y[in_window]))]
+        peak_loc    = float(x[idx_max])
+        peak_height = float(y[idx_max])
 
-        local_x = x[kde_mask]
-        local_y = y[kde_mask]
-
-        # Require a genuine local maximum — reject shoulders of adjacent peaks
-        peak_idxs, _ = find_peaks(local_y)
-        if len(peak_idxs) == 0:
-            svara_stats[name] = None
-            continue
-        # Among genuine peaks, take the tallest
-        idx_max     = peak_idxs[int(np.argmax(local_y[peak_idxs]))]
-        peak_loc    = float(local_x[idx_max])
-        peak_height = float(local_y[idx_max])
-
-        global_idx = int(np.clip(np.searchsorted(x, peak_loc), 0, len(x) - 1))
-        peak_width = compute_fwhm(x, y, global_idx)
+        peak_width = compute_fwhm(x, y, idx_max)
 
         raw_mask = (cents >= svara - WINDOW_CENTS) & (cents <= svara + WINDOW_CENTS)
         raw_vals = cents[raw_mask]
@@ -671,8 +669,9 @@ def fig_kde_overlay(all_kde: dict, all_cents: dict) -> object:
 
 
 def fig_individual_kde(label: str, recording_name: str, x: np.ndarray,
-                       y: np.ndarray, cents: np.ndarray, color: str) -> object:
-    """Single-recording KDE with histogram background."""
+                       y: np.ndarray, cents: np.ndarray, color: str,
+                       svara_stats: dict | None = None) -> object:
+    """Single-recording KDE with histogram background and svara peak annotations."""
     _apply_plot_style()
     fig, ax = plt.subplots(figsize=(14, 3.2))
 
@@ -683,6 +682,27 @@ def fig_individual_kde(label: str, recording_name: str, x: np.ndarray,
     density   = counts / (counts.sum() * bin_w)
     ax.bar(bin_ctrs, density, width=bin_w * 0.9, color=color, alpha=0.25, zorder=1)
     ax.plot(x, y, color=color, lw=1.8, zorder=2)
+
+    if svara_stats:
+        y_top = float(y.max())
+        for sname, stats in svara_stats.items():
+            if stats is None:
+                continue
+            ploc    = stats["peak_loc"]
+            pheight = stats["peak_height"]
+            present = stats.get("present", False)
+            ann_color = "#222222" if present else "#aaaaaa"
+            ax.axvline(ploc, color=ann_color, lw=0.6, ls=":", alpha=0.55, zorder=3)
+            ax.annotate(
+                sname,
+                xy=(ploc, pheight),
+                xytext=(0, 5),
+                textcoords="offset points",
+                ha="center", va="bottom",
+                fontsize=6.5,
+                color=ann_color,
+                zorder=4,
+            )
 
     _svara_axis(ax)
     ax.set_xlabel("Cents from tonic")
@@ -744,6 +764,64 @@ def fig_boxplots(all_peaks: dict, omnibus: dict) -> dict:
         plt.tight_layout()
         figs[metric] = fig
     return figs
+
+
+def fig_combined_histogram(all_kde: dict, all_cents: dict) -> object:
+    """
+    One subplot per group: pooled KDE (all recordings concatenated) as thick line,
+    individual recording KDEs as faint traces, and mean ± 1 SD band.
+    """
+    _apply_plot_style()
+    labels = sorted(all_kde.keys())
+    colors = _group_colors(labels)
+    n = len(labels)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 3.5 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, label in zip(axes, labels):
+        c = colors[label]
+        cents_list = all_cents[label]
+        kde_list   = all_kde[label]
+
+        # Pooled KDE from concatenated cents
+        pooled = np.concatenate(cents_list)
+        x_pool, y_pool = compute_kde(pooled)
+
+        # Individual KDE traces → mean ± SD band
+        x_ref = kde_list[0][0]
+        ys    = np.array([yi for _, yi in kde_list])
+        mu    = ys.mean(0)
+        sig   = ys.std(0)
+
+        # Histogram bars (pooled)
+        bin_edges = np.linspace(0, 1200, 121)
+        bin_w     = bin_edges[1] - bin_edges[0]
+        bin_ctrs  = (bin_edges[:-1] + bin_edges[1:]) / 2
+        counts, _ = np.histogram(pooled, bins=bin_edges)
+        density   = counts / (counts.sum() * bin_w)
+        ax.bar(bin_ctrs, density, width=bin_w * 0.9, color=c, alpha=0.15, zorder=1)
+
+        # Individual traces
+        for _, yi in kde_list:
+            ax.plot(x_ref, yi, color=c, lw=0.5, alpha=0.12, zorder=2)
+
+        # Mean ± 1 SD band
+        ax.fill_between(x_ref, mu - sig, mu + sig, color=c, alpha=0.22, zorder=3,
+                        label="mean ± 1 SD")
+
+        # Pooled KDE (main line)
+        ax.plot(x_pool, y_pool, color=c, lw=2.2, zorder=4, label="pooled KDE")
+
+        _svara_axis(ax)
+        ax.set_ylabel("Density")
+        ax.set_title(f"{label}  ({len(cents_list)} recording(s)  ·  "
+                     f"{len(pooled):,} voiced frames)")
+        ax.legend(fontsize=8, loc="upper right")
+
+    axes[-1].set_xlabel("Cents from tonic")
+    plt.tight_layout()
+    return fig
 
 
 def fig_presence(all_peaks: dict) -> object:
@@ -908,6 +986,9 @@ def build_report(
     bp_b64  = {m: _b64(f) for m, f in bp_figs.items()}
     for f in bp_figs.values():
         plt.close(f)
+
+    ch_fig  = fig_combined_histogram(all_kde, all_cents)
+    ch_b64  = _b64(ch_fig);  plt.close(ch_fig)
 
     # ---- Helpers for tables ------------------------------------------------
     def _summary_cells(s: dict) -> str:
@@ -1229,11 +1310,12 @@ def build_report(
     ind_blocks = []
     for label in labels:
         recording_imgs = []
-        for path, (x, y), cents in zip(
-            all_paths[label], all_kde[label], all_cents[label]
+        for path, (x, y), cents, rec_peaks in zip(
+            all_paths[label], all_kde[label], all_cents[label], all_peaks[label]
         ):
             name = os.path.basename(path)
-            fig  = fig_individual_kde(label, name, x, y, cents, colors[label])
+            fig  = fig_individual_kde(label, name, x, y, cents, colors[label],
+                                      svara_stats=rec_peaks)
             recording_imgs.append(
                 f"<div class='ind-kde'>{_img(_b64(fig))}</div>"
             )
@@ -1255,10 +1337,20 @@ def build_report(
         + "</details>"
     )
 
+    sec10 = _section(
+        "<h2>10. Combined pitch histograms per group</h2>"
+        "<p>Each panel shows the pooled KDE computed from all recordings in the group "
+        "(thick line), overlaid on the mean&nbsp;±&nbsp;1&nbsp;SD band from individual "
+        "recording KDEs (shading) and faint individual traces. "
+        "Bar chart shows the pooled pitch histogram.</p>"
+        + _img(ch_b64)
+    )
+
     sections = [sec1, sec2, sec3, sec4, sec5, sec6, sec7]
     if sec8:
         sections.append(sec8)
     sections.append(sec9)
+    sections.append(sec10)
 
     return "\n".join([
         "<!DOCTYPE html><html lang='en'>",
