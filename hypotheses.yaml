@@ -1,23 +1,23 @@
 hypotheses:
-  - svara: D1
+  - svara: D2/N1
     metric: peak_height
     comparison: Group1 > Group2
-    label: "D1 more prominent in Group 1"
-
-  - svara: D1
-    metric: offset_cents
-    comparison: Group1 != Group2
-    label: "D1 intonation differs between groups"
-
-  - svara: G3
-    metric: offset_cents
-    comparison: Group1 < Group2
-    label: "G3 flatter in Group 1"
+    label: "D2 more prominent in Group 1"
 
   - svara: M1
+    metric: kurtosis
+    comparison: Group1 < Group2
+    label: "M1 sharper (less gamaka) in Group 1"
+    
+  - svara: R2/G1
     metric: peak_width
-    comparison: Group1 > Group2
-    label: "M1 wider (more gamaka) in Group 1"
+    comparison: Group3 > Group2
+    label: "R2 shows more Gamakas in group 3."
+
+  - svara: M1
+    metric: peak_height
+    comparison: Group1 > Group3
+    label: "M1 sharper (less gamaka) in Group 1"
 
   - svara: S
     metric: peak_height

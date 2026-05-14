@@ -336,22 +336,32 @@ def _load_tonic(audio_path: str, tonic: str | float | None = None) -> float:
 
 def load_manifest(manifest_path: str) -> dict:
     """
-    Return {group_label: [{"path": str, "tonic": float | None}, ...]}
+    Return {group_label: [{"path": str, "tonic": float | None, "year": int | None}, ...]}
 
     CSV must have 'path' and 'group' columns. Optional 'tonic' column (Hz)
-    takes precedence over a _tonic.txt sidecar.
+    takes precedence over a _tonic.txt sidecar. Optional 'year' column (integer)
+    enables temporal trend plots.
     """
     groups: dict = defaultdict(list)
     with open(manifest_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        has_tonic = "tonic" in (reader.fieldnames or [])
+        fieldnames = reader.fieldnames or []
+        has_tonic = "tonic" in fieldnames
+        has_year  = "year"  in fieldnames
         for row in reader:
             tonic_val = None
             if has_tonic and row.get("tonic", "").strip():
-                tonic_val = row["tonic"].strip()  # kept as string; parse_tonic handles Hz or note name
+                tonic_val = row["tonic"].strip()
+            year_val = None
+            if has_year and row.get("year", "").strip():
+                try:
+                    year_val = int(row["year"].strip())
+                except ValueError:
+                    pass
             groups[row["group"].strip()].append({
                 "path":  row["path"].strip(),
                 "tonic": tonic_val,
+                "year":  year_val,
             })
     return dict(groups)
 
@@ -858,6 +868,58 @@ def fig_presence(all_peaks: dict) -> object:
     return fig
 
 
+def fig_temporal_features(all_peaks: dict, all_years: dict, metric: str) -> object:
+    """
+    Scatter plot of year vs feature value for one metric, one subplot per svara (4×3 grid).
+    Each point is one composition, coloured by group.
+    """
+    _apply_plot_style()
+    labels = sorted(all_peaks.keys())
+    colors = _group_colors(labels)
+    fig, axes = plt.subplots(4, 3, figsize=(15, 14))
+    axes_flat = axes.flatten()
+
+    for ax, (svara, name) in zip(axes_flat, zip(SVARA_GRID, SVARA_NAMES)):
+        drawn = False
+        for label in labels:
+            peaks_list = all_peaks[label]
+            years_list = all_years.get(label, [])
+            xs, ys = [], []
+            for i, peak in enumerate(peaks_list):
+                year = years_list[i] if i < len(years_list) else None
+                if year is None:
+                    continue
+                stats = peak.get(name)
+                if stats is None or not stats.get("present", False):
+                    continue
+                val = stats.get(metric)
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    continue
+                xs.append(year)
+                ys.append(val)
+            if xs:
+                ax.scatter(xs, ys, color=colors[label], label=label,
+                           s=28, alpha=0.80, edgecolors="none", zorder=3)
+                drawn = True
+        ax.set_title(name, fontsize=10, pad=4)
+        ax.set_xlabel("Year", fontsize=8)
+        ax.set_ylabel(METRIC_LABELS[metric], fontsize=8)
+        if not drawn:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="#aaaaaa", fontsize=9)
+
+    # shared legend in first subplot
+    handles = [
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=colors[lbl],
+                   markersize=7, label=lbl)
+        for lbl in labels
+    ]
+    axes_flat[0].legend(handles=handles, fontsize=8, loc="best")
+    fig.suptitle(f"Temporal development — {METRIC_LABELS[metric]}", fontsize=12, y=1.01)
+    plt.tight_layout()
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # HTML helpers
 # ---------------------------------------------------------------------------
@@ -968,6 +1030,7 @@ def build_report(
     n_tests_pairwise: int,
     alpha: float = 0.05,
     hypothesis_results: list | None = None,
+    all_years: dict | None = None,   # {label: [year_or_None, ...]}
 ) -> str:
     labels = sorted(all_peaks.keys())
     pairs  = list(combinations(labels, 2))
@@ -1346,11 +1409,35 @@ def build_report(
         + _img(ch_b64)
     )
 
+    # ---- Section 11: Temporal feature development (only when year data present) ----
+    sec11 = None
+    has_years = all_years and any(
+        y is not None
+        for years_list in all_years.values()
+        for y in years_list
+    )
+    if has_years:
+        temporal_html = ""
+        for metric in METRICS:
+            tf_fig = fig_temporal_features(all_peaks, all_years, metric)
+            tf_b64 = _b64(tf_fig)
+            plt.close(tf_fig)
+            temporal_html += f"<h3>{METRIC_LABELS[metric]}</h3>{_img(tf_b64)}"
+        sec11 = _section(
+            "<h2>11. Temporal feature development</h2>"
+            "<p>Each panel shows how a feature value for one svara has changed over "
+            "composition year. Each point is one composition; colours indicate groups. "
+            "A linear trend line is drawn when two or more dated points exist per group.</p>"
+            + temporal_html
+        )
+
     sections = [sec1, sec2, sec3, sec4, sec5, sec6, sec7]
     if sec8:
         sections.append(sec8)
     sections.append(sec9)
     sections.append(sec10)
+    if sec11:
+        sections.append(sec11)
 
     return "\n".join([
         "<!DOCTYPE html><html lang='en'>",
@@ -1533,6 +1620,7 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path):
     all_kde:    dict = {}
     all_cents:  dict = {}
     all_peaks:  dict = {}
+    all_years:  dict = {}
 
     for label, entries in sorted(selected.items()):
         log.info("--- Processing group '%s' (%d file(s)) ---", label, len(entries))
@@ -1547,6 +1635,7 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path):
         all_kde[label]    = kde_list
         all_cents[label]  = cents_list
         all_peaks[label]  = peaks_list
+        all_years[label]  = [e.get("year") for e in entries]
         log.info("Group '%s' done", label)
 
     hypotheses = []
@@ -1586,6 +1675,7 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path):
         n_tests_omni, n_tests_pair,
         alpha=alpha,
         hypothesis_results=hypothesis_results,
+        all_years=all_years,
     )
     with open(output, "w", encoding="utf-8") as f:
         f.write(html)
