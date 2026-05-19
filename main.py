@@ -46,7 +46,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import gaussian_kde, kruskal, kurtosis, mannwhitneyu, skew
-from scipy.signal import find_peaks
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -204,7 +203,8 @@ def compute_kde(cents_values: np.ndarray, bw_method: float = KDE_BW):
     return x, y
 
 
-def analyse_file(audio_path: str, tonic: float | None = None) -> tuple:
+def analyse_file(audio_path: str, tonic: float | None = None,
+                 segment: tuple | None = None) -> tuple:
     """
     Load (or extract+cache) pitch, compute density-normalised KDE, and return
     per-svara statistics.
@@ -213,6 +213,7 @@ def analyse_file(audio_path: str, tonic: float | None = None) -> tuple:
     ----------
     audio_path : path to audio file
     tonic      : Hz — if None, falls back to _tonic.txt sidecar
+    segment    : (start_sec, end_sec) — if given, restrict analysis to that window
 
     Returns
     -------
@@ -223,6 +224,12 @@ def analyse_file(audio_path: str, tonic: float | None = None) -> tuple:
     """
     pitch_track = _load_or_extract_pitch(audio_path)
     tonic = _load_tonic(audio_path, tonic)
+
+    if segment is not None:
+        start_sec, end_sec = segment
+        mask = (pitch_track[:, 0] >= start_sec) & (pitch_track[:, 0] <= end_sec)
+        pitch_track = pitch_track[mask]
+        log.debug("Segment [%.2f, %.2f]s: %d frames", start_sec, end_sec, len(pitch_track))
 
     pitch_vals = pitch_track[:, 1]
     n_total = len(pitch_vals)
@@ -352,6 +359,25 @@ def load_manifest(manifest_path: str) -> dict:
             groups[row["group"].strip()].append({
                 "path":  row["path"].strip(),
                 "tonic": tonic_val,
+            })
+    return dict(groups)
+
+
+def load_annotations(path: str) -> dict:
+    """
+    Parse an annotations TSV (columns: track, start, end, duration, label).
+    Returns {label: [{"track": str, "start": float, "end": float}, ...]}
+    """
+    groups: dict = defaultdict(list)
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            if not row.get("track", "").strip():
+                continue
+            groups[row["label"].strip()].append({
+                "track": row["track"].strip(),
+                "start": float(row["start"].strip()),
+                "end":   float(row["end"].strip()),
             })
     return dict(groups)
 
@@ -536,7 +562,6 @@ def _interpret(svara: str, metric: str, mean_a: float, mean_b: float,
         return ""
     delta  = mean_b - mean_a
     higher = label_a if mean_a > mean_b else label_b
-    lower  = label_b if mean_a > mean_b else label_a
 
     if metric == "offset_cents":
         sharp, flat, d = (label_a, label_b, -delta) if delta < 0 else (label_b, label_a, delta)
@@ -684,7 +709,6 @@ def fig_individual_kde(label: str, recording_name: str, x: np.ndarray,
     ax.plot(x, y, color=color, lw=1.8, zorder=2)
 
     if svara_stats:
-        y_top = float(y.max())
         for sname, stats in svara_stats.items():
             if stats is None:
                 continue
@@ -968,6 +992,7 @@ def build_report(
     n_tests_pairwise: int,
     alpha: float = 0.05,
     hypothesis_results: list | None = None,
+    sections_only: bool = False,
 ) -> str:
     labels = sorted(all_peaks.keys())
     pairs  = list(combinations(labels, 2))
@@ -997,12 +1022,6 @@ def build_report(
             f"<td>{_fmt(s['std'])}</td>"
             f"<td>{_fmt(s['median'])}</td>"
             f"<td>{s['n']}</td>"
-        )
-
-    def _summary_header(label: str) -> str:
-        return (
-            f"<th>Mean ({label})</th><th>SD ({label})</th>"
-            f"<th>Median ({label})</th><th>n ({label})</th>"
         )
 
     # ---- Section 1: Dataset ------------------------------------------------
@@ -1170,9 +1189,11 @@ def build_report(
         for m in METRICS
     )
     sec6 = _section(
-        "<h2>6. Per-metric comparisons</h2>"
+        "<details class='sec-collapsible'>"
+        "<summary><h2 style='display:inline'>6. Per-metric comparisons</h2></summary>"
         "<p>Stars mark svaras with a significant Kruskal-Wallis result after Bonferroni correction.</p>"
         + bp_html
+        + "</details>"
     )
 
     # ---- Section 7: Full per-svara tables ----------------------------------
@@ -1247,7 +1268,8 @@ def build_report(
         )
 
     sec7 = _section(
-        "<h2>7. Full per-svara statistics</h2>"
+        "<details class='sec-collapsible'>"
+        "<summary><h2 style='display:inline'>7. Full per-svara statistics</h2></summary>"
         "<p>Each svara has two tables. "
         "<strong>Omnibus:</strong> one row per metric showing mean ± SD for every group, "
         "the Kruskal-Wallis H statistic, and Bonferroni-corrected p-value — answers "
@@ -1257,6 +1279,7 @@ def build_report(
         "<em>&ldquo;which specific pair differs, and by how much?&rdquo;</em> "
         "Yellow rows are Bonferroni-significant.</p>"
         + "".join(svara_blocks)
+        + "</details>"
     )
 
     # ---- Section 8: Focused hypotheses -------------------------------------
@@ -1352,13 +1375,80 @@ def build_report(
     sections.append(sec9)
     sections.append(sec10)
 
+    inner = "\n".join(sections)
+
+    if sections_only:
+        return inner
+
     return "\n".join([
         "<!DOCTYPE html><html lang='en'>",
         "<head><meta charset='UTF-8'>",
         f"<title>Intonation Report — {', '.join(labels)}</title>",
         f"<style>{_CSS}</style></head><body>",
         f"<h1>Intonation Analysis: {' · '.join(labels)}</h1>",
-        *sections,
+        inner,
+        "</body></html>",
+    ])
+
+
+def _build_tabbed_html(tab_contents: dict) -> str:
+    """
+    Wrap per-annotation-label section HTML in a single-page tabbed layout.
+    tab_contents: {label: inner_sections_html}
+    """
+    labels = sorted(tab_contents.keys())
+
+    _TAB_CSS = """
+.tab-bar {
+    display: flex; flex-wrap: wrap; gap: 0;
+    border-bottom: 2px solid #6baed6; margin-bottom: 1.8rem;
+}
+.tab-btn {
+    padding: 0.45rem 1.3rem; border: 1px solid #d0d8e4; border-bottom: none;
+    background: #f4f7fb; cursor: pointer; border-radius: 4px 4px 0 0;
+    font-size: 0.9rem; color: #555; margin-right: 3px; font-family: inherit;
+}
+.tab-btn.active {
+    background: #fff; border-color: #6baed6; color: #1a3a5c;
+    font-weight: 600; margin-bottom: -2px; border-bottom: 2px solid #fff;
+}
+.tab-btn:hover:not(.active) { background: #eef2f8; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+"""
+
+    buttons = "".join(
+        f'<button class="tab-btn{" active" if i == 0 else ""}" '
+        f'onclick="showTab(this,{i})">{lbl}</button>'
+        for i, lbl in enumerate(labels)
+    )
+
+    panels = "".join(
+        f'<div id="panel-{i}" class="tab-panel{" active" if i == 0 else ""}">'
+        f"<h1>Pattern: {lbl} — Intonation Analysis</h1>"
+        + tab_contents[lbl]
+        + "</div>"
+        for i, lbl in enumerate(labels)
+    )
+
+    script = """\
+<script>
+function showTab(btn, idx) {
+    document.querySelectorAll('.tab-panel').forEach(function(el){ el.classList.remove('active'); });
+    document.querySelectorAll('.tab-btn').forEach(function(el){ el.classList.remove('active'); });
+    document.getElementById('panel-' + idx).classList.add('active');
+    btn.classList.add('active');
+}
+</script>"""
+
+    return "\n".join([
+        "<!DOCTYPE html><html lang='en'>",
+        "<head><meta charset='UTF-8'>",
+        "<title>Intonation Report — annotated patterns</title>",
+        f"<style>{_CSS}{_TAB_CSS}</style></head><body>",
+        f'<div class="tab-bar">{buttons}</div>',
+        panels,
+        script,
         "</body></html>",
     ])
 
@@ -1495,8 +1585,12 @@ def extract(ctx, audio_paths):
 @click.option("--hypotheses", "hypotheses_path", default=None,
               type=click.Path(exists=True),
               help="YAML file of focused hypotheses (optional).")
+@click.option("--annotations", "annotations_path", default=None,
+              type=click.Path(exists=True),
+              help="TSV annotations file; restricts analysis to labelled segments, "
+                   "grouping by annotation label instead of manifest group.")
 @click.pass_context
-def run(ctx, manifest, groups, output, alpha, hypotheses_path):
+def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path):
     """
     Full pipeline: process all groups in MANIFEST, compare them, write HTML report.
 
@@ -1510,7 +1604,46 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path):
     all_groups = load_manifest(manifest)
     log.info("Manifest contains %d group(s): %s", len(all_groups), sorted(all_groups.keys()))
 
-    if groups:
+    if annotations_path:
+        log.info("Loading annotations: %s", annotations_path)
+        annotations = load_annotations(annotations_path)
+        log.info(
+            "Annotation patterns: %s  (%d segment(s) total)",
+            sorted(annotations.keys()),
+            sum(len(v) for v in annotations.values()),
+        )
+
+        # Build stem → (manifest entry + group) lookup
+        stem_to_group_entry = {}
+        for grp, entries in all_groups.items():
+            for e in entries:
+                stem = os.path.splitext(os.path.basename(e["path"]))[0]
+                stem_to_group_entry[stem] = (grp, e)
+
+        # Group annotated segments by manifest group, preserving annotation label
+        by_group: dict = defaultdict(list)
+        for ann_label, ann_entries in annotations.items():
+            for ann in ann_entries:
+                result = stem_to_group_entry.get(ann["track"])
+                if result is None:
+                    log.warning(
+                        "Annotation track '%s' not found in manifest, skipping", ann["track"]
+                    )
+                    continue
+                grp, entry = result
+                by_group[grp].append({
+                    "path":          entry["path"],
+                    "tonic":         entry["tonic"],
+                    "segment":       (ann["start"], ann["end"]),
+                    "pattern_label": ann_label,
+                })
+
+        selected = dict(by_group)
+        log.info(
+            "Segments per manifest group: %s",
+            {g: len(v) for g, v in sorted(selected.items())},
+        )
+    elif groups:
         missing = [g for g in groups if g not in all_groups]
         if missing:
             raise click.UsageError(
@@ -1521,72 +1654,113 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path):
     else:
         selected = all_groups
 
-    if len(selected) < 2:
-        raise click.UsageError(
-            f"Need at least 2 groups; found: {sorted(selected.keys())}"
-        )
-
-    for lbl, entries in sorted(selected.items()):
-        log.info("  %-20s  %d file(s)", lbl, len(entries))
-
-    all_paths:  dict = {}
-    all_kde:    dict = {}
-    all_cents:  dict = {}
-    all_peaks:  dict = {}
-
-    for label, entries in sorted(selected.items()):
-        log.info("--- Processing group '%s' (%d file(s)) ---", label, len(entries))
-        kde_list, cents_list, peaks_list = [], [], []
-        for i, entry in enumerate(entries, 1):
-            log.info("[%d/%d] %s", i, len(entries), entry["path"])
-            x, y, stats, cents = analyse_file(entry["path"], tonic=entry["tonic"])
-            kde_list.append((x, y))
-            cents_list.append(cents)
-            peaks_list.append(stats)
-        all_paths[label]  = [e["path"] for e in entries]
-        all_kde[label]    = kde_list
-        all_cents[label]  = cents_list
-        all_peaks[label]  = peaks_list
-        log.info("Group '%s' done", label)
-
     hypotheses = []
     if hypotheses_path:
         log.info("Loading hypotheses: %s", hypotheses_path)
         hypotheses = load_hypotheses(hypotheses_path)
         log.info("%d hypothesis/hypotheses loaded", len(hypotheses))
 
-    log.info("Running statistical comparison...")
-    omnibus, pairwise, n_peaks_omni, n_peaks_pair, n_tests_omni, n_tests_pair = \
-        compare_groups(all_peaks, alpha=alpha)
+    def _process_selected(run_selected: dict, ann_label: str | None) -> str | None:
+        """Run the full analysis for one selected dict. Returns sections HTML."""
+        if len(run_selected) < 2:
+            log.warning(
+                "Pattern '%s': need at least 2 groups with segments, found %s — skipping",
+                ann_label, sorted(run_selected.keys()),
+            )
+            return None
 
-    n_sig_omni = sum(
-        omnibus[sv][mt].get("significant", False)
-        for sv in SVARA_NAMES for mt in METRICS
-    )
-    n_sig_pair = sum(
-        pairwise[pair][sv][mt].get("significant", False)
-        for pair in pairwise
-        for sv in SVARA_NAMES for mt in METRICS
-    )
-    log.info("Omnibus significant:  %d / %d", n_sig_omni, n_tests_omni)
-    log.info("Pairwise significant: %d / %d", n_sig_pair, n_tests_pair)
+        for lbl, entries in sorted(run_selected.items()):
+            log.info("  %-20s  %d segment(s)", lbl, len(entries))
 
-    hypothesis_results = None
-    if hypotheses:
-        log.info("Testing %d focused hypothesis/hypotheses...", len(hypotheses))
-        hypothesis_results = test_hypotheses(hypotheses, all_peaks, alpha=alpha)
-        n_sig_hyp = sum(r["significant"] for r in hypothesis_results)
-        log.info("Focused hypotheses significant: %d / %d", n_sig_hyp, len(hypotheses))
+        all_paths:  dict = {}
+        all_kde:    dict = {}
+        all_cents:  dict = {}
+        all_peaks:  dict = {}
 
-    log.info("Building report → %s", output)
-    html = build_report(
-        all_paths, all_kde, all_cents, all_peaks,
-        omnibus, pairwise,
-        n_peaks_omni, n_peaks_pair,
-        n_tests_omni, n_tests_pair,
-        alpha=alpha,
-        hypothesis_results=hypothesis_results,
-    )
+        for label, entries in sorted(run_selected.items()):
+            log.info("--- Processing group '%s' (%d file(s)) ---", label, len(entries))
+            kde_list, cents_list, peaks_list, display_names = [], [], [], []
+            for i, entry in enumerate(entries, 1):
+                seg = entry.get("segment")
+                seg_str = f" [{seg[0]:.2f}–{seg[1]:.2f}s]" if seg else ""
+                stem = os.path.splitext(os.path.basename(entry["path"]))[0]
+                display = f"{stem}{seg_str}"
+                log.info("[%d/%d] %s", i, len(entries), display)
+                try:
+                    x, y, stats, cents = analyse_file(
+                        entry["path"], tonic=entry["tonic"], segment=seg
+                    )
+                except Exception as exc:
+                    log.warning("Skipping %s — %s", display, exc)
+                    continue
+                kde_list.append((x, y))
+                cents_list.append(cents)
+                peaks_list.append(stats)
+                display_names.append(display)
+            all_paths[label]  = display_names
+            all_kde[label]    = kde_list
+            all_cents[label]  = cents_list
+            all_peaks[label]  = peaks_list
+            log.info("Group '%s' done (%d/%d succeeded)", label, len(peaks_list), len(entries))
+
+        log.info("Running statistical comparison...")
+        omnibus, pairwise, n_peaks_omni, n_peaks_pair, n_tests_omni, n_tests_pair = \
+            compare_groups(all_peaks, alpha=alpha)
+
+        n_sig_omni = sum(
+            omnibus[sv][mt].get("significant", False)
+            for sv in SVARA_NAMES for mt in METRICS
+        )
+        n_sig_pair = sum(
+            pairwise[pair][sv][mt].get("significant", False)
+            for pair in pairwise
+            for sv in SVARA_NAMES for mt in METRICS
+        )
+        log.info("Omnibus significant:  %d / %d", n_sig_omni, n_tests_omni)
+        log.info("Pairwise significant: %d / %d", n_sig_pair, n_tests_pair)
+
+        hypothesis_results = None
+        if hypotheses:
+            log.info("Testing %d focused hypothesis/hypotheses...", len(hypotheses))
+            hypothesis_results = test_hypotheses(hypotheses, all_peaks, alpha=alpha)
+            n_sig_hyp = sum(r["significant"] for r in hypothesis_results)
+            log.info("Focused hypotheses significant: %d / %d", n_sig_hyp, len(hypotheses))
+
+        return build_report(
+            all_paths, all_kde, all_cents, all_peaks,
+            omnibus, pairwise,
+            n_peaks_omni, n_peaks_pair,
+            n_tests_omni, n_tests_pair,
+            alpha=alpha,
+            hypothesis_results=hypothesis_results,
+            sections_only=annotations_path is not None,
+        )
+
+    if annotations_path:
+        # One tab per distinct annotation label in a single output file
+        tab_contents = {}
+        for ann_label in sorted(annotations.keys()):
+            log.info("=== Pattern '%s' ===", ann_label)
+            run_selected = {
+                grp: [e for e in entries if e.get("pattern_label") == ann_label]
+                for grp, entries in selected.items()
+                if any(e.get("pattern_label") == ann_label for e in entries)
+            }
+            sections_html = _process_selected(run_selected, ann_label)
+            if sections_html is not None:
+                tab_contents[ann_label] = sections_html
+
+        if not tab_contents:
+            raise click.UsageError("No annotation labels produced a valid analysis.")
+
+        log.info("Building tabbed report → %s", output)
+        html = _build_tabbed_html(tab_contents)
+    else:
+        log.info("Building report → %s", output)
+        html = _process_selected(selected, ann_label=None)
+        if html is None:
+            raise click.UsageError(f"Need at least 2 groups; found: {sorted(selected.keys())}")
+
     with open(output, "w", encoding="utf-8") as f:
         f.write(html)
 

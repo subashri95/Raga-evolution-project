@@ -1,6 +1,6 @@
 # Rāga Intonation Analysis
 
-A pipeline for comparing svara intonation between two groups of Carnatic or Hindustānī recordings. For each recording it extracts the predominant pitch track, builds a tonic-normalised KDE histogram, and characterises each svara peak by location, height, width, skewness, and kurtosis. A Mann-Whitney U test with Bonferroni correction is run across all (svara, metric) pairs and the results are compiled into a self-contained HTML report.
+A pipeline for comparing svara intonation between groups of Carnatic or Hindustānī recordings. For each recording (or annotated segment) it extracts the predominant pitch track, builds a tonic-normalised KDE histogram, and characterises each svara peak by location, height, width, skewness, and kurtosis. Kruskal-Wallis omnibus and Mann-Whitney U pairwise tests with Bonferroni correction are run across all (svara, metric) pairs and compiled into a self-contained HTML report.
 
 ## Install
 
@@ -27,7 +27,7 @@ audio/groupB/recording_02.wav,GroupB,233.08
 ```
 
 - **path**: absolute or relative path to the audio file
-- **group**: label string — must match `--label-a` / `--label-b` exactly
+- **group**: label string used to organise recordings into comparison groups
 - **tonic**: tonic frequency in Hz (e.g. `293.66`) **or** a note name string (e.g. `A`, `F#`, `Bb`). Note names are resolved to the third octave (C3 = 130.81 Hz). Enharmonic aliases (`Db`, `Eb`, `Gb`, `Ab`, `Bb`) are accepted.
 
 The `tonic` column is optional. If it is absent or a cell is empty, the pipeline falls back to a `_tonic.txt` sidecar file at the same path as the audio (containing a single float in Hz). Having the tonic in the manifest is generally preferable as it keeps all metadata in one place.
@@ -62,6 +62,41 @@ To include focused hypothesis tests (see below):
 python main.py run manifest.csv --hypotheses hypotheses.yaml --output report.html
 ```
 
+### Run analysis on annotated segments
+
+When you have time-stamped annotations marking specific musical patterns or phrases, pass the annotations file with `--annotations`. The analysis is restricted to only those segments, but recordings are still **grouped by their manifest group** — so the question being asked is: *does this pattern vary between groups?*
+
+```bash
+python main.py run manifest.csv --annotations Annotations/annotations.csv --output report.html
+```
+
+**Annotations file format** (tab-separated, `.tsv`):
+
+```
+track	start	end	duration	label
+Arukkuponnambalan-bhairavi-GKB-NM	0.96	4.65	3.69	test
+attaruNam abhayam-Bhairavi-PS-SSub	0.96	4.65	3.69	test
+KanakaKundalam-BhAiravi-DP-PSR	0.96	4.65	3.69	test
+```
+
+- **track**: filename stem of the audio file (no extension, no directory) — must match a file in the manifest
+- **start** / **end**: segment boundaries in seconds
+- **duration**: informational only, not used by the pipeline
+- **label**: identifies the musical pattern (e.g. `test`, `ascending_phrase`). Multiple rows with the same label are different occurrences of the same pattern across performances.
+
+Each annotated segment is extracted from the full cached pitch track (no re-extraction needed). The segment's group is inherited from the manifest. Segments too short to produce a reliable KDE are skipped with a warning.
+
+Each distinct annotation label gets its own tab in a single output file. Clicking a tab at the top of the report switches to the full analysis for that pattern. Without annotations a single report with no tabs is produced as normal.
+
+> **Hypotheses with annotations:** group names in the hypotheses YAML are always manifest group names (e.g. `Group1`, `Group2`) — they do not change when `--annotations` is used.
+
+```bash
+python main.py run manifest.csv \
+    --annotations Annotations/annotations.csv \
+    --hypotheses hypotheses.yaml \
+    --output report.html
+```
+
 ### Extract features for ML pipeline
 
 ```bash
@@ -90,14 +125,15 @@ python main.py features manifest.csv features.csv --groups GroupA --groups Group
 
 72 feature columns in total (12 svaras × 6 metrics). Cells are `NaN` when a svara peak is not detected in a recording.
 
-### Run the full comparison pipeline options
+### Run options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--groups` / `-g` | all groups | Repeat to restrict to a subset of manifest groups |
+| `--groups` / `-g` | all groups | Repeat to restrict to a subset of manifest groups (ignored when `--annotations` is used) |
 | `--output` | `report.html` | Output HTML path |
 | `--alpha` | `0.05` | Family-wise error rate for Bonferroni correction |
 | `--hypotheses` | *(none)* | Path to a YAML hypotheses file (optional) |
+| `--annotations` | *(none)* | Path to a TSV annotations file; restricts analysis to labelled segments |
 
 ## Focused hypotheses
 
@@ -138,15 +174,16 @@ Results appear in **Section 8** of the report with their own Bonferroni-correcte
 
 | Section | Contents |
 |---------|----------|
-| 1. Dataset | File counts, correction denominators, methodology notes |
+| 1. Dataset | File/segment counts, correction denominators, methodology notes |
 | 2. Pitch-class distributions | Mean ± 1 SD KDE overlay for all groups |
 | 3. Svara presence | Presence rate per svara; Kruskal-Wallis on count of present svaras |
 | 4. Omnibus tests | Kruskal-Wallis per (svara, metric) — significant results highlighted |
 | 5. Pairwise comparisons | MWU post-hoc for every pair of groups |
-| 6. Per-metric boxplots | One figure per metric, all groups side by side |
-| 7. Full per-svara tables | Omnibus + all pairwise results with effect sizes |
+| 6. Per-metric boxplots | Collapsible — one figure per metric, all groups side by side |
+| 7. Full per-svara tables | Collapsible — omnibus + all pairwise results with effect sizes |
 | 8. Focused hypotheses | *(only present when `--hypotheses` is supplied)* Per-hypothesis MWU results with focused Bonferroni correction |
-| 9. Individual histograms | Collapsible — KDE + pitch histogram for every recording |
+| 9. Individual histograms | Collapsible — KDE + pitch histogram for every recording/segment |
+| 10. Combined histograms | Pooled KDE per group with mean ± 1 SD band and individual traces |
 
 ## Statistical approach
 
@@ -182,15 +219,8 @@ The full width at half maximum of the KDE peak. A narrow peak indicates that the
 
 ### Skewness
 
-The asymmetry of the pitch distribution within the svara window, computed from raw pitch samples. A positive skew means the distribution has a longer tail above the peak (the performer tends to arrive at the svara from below and overshoot, or dwell on pitches above it); negative skew indicates the opposite. Skewness encodes directional information about how the svara is approached. A svara whose gamaka consistently oscillates asymmetrically above or below its nominal position will produce a measurably skewed distribution. 
+The asymmetry of the pitch distribution within the svara window, computed from raw pitch samples. A positive skew means the distribution has a longer tail above the peak (the performer tends to arrive at the svara from below and overshoot, or dwell on pitches above it); negative skew indicates the opposite. Skewness encodes directional information about how the svara is approached. A svara whose gamaka consistently oscillates asymmetrically above or below its nominal position will produce a measurably skewed distribution.
 
 ### Excess kurtosis
 
 The peakedness (or flatness) of the pitch distribution relative to a Gaussian, computed from raw pitch samples (Fisher definition, so 0 = Gaussian). Positive excess kurtosis means pitch values cluster tightly around the svara with heavy tails — the performer spends most time precisely on the svara with occasional brief excursions. This is associated with a clean, sustained svara, possibly with sparse gamaka. Negative excess kurtosis indicates a flatter, more spread distribution — the performer rarely settles exactly on the nominal svara position, spending time spread across the window. This is the signature of dense, continuous gamaka such as *kampita* (oscillation), where the pitch is almost never stationary. Kurtosis is therefore a proxy for the degree and continuity of ornamentation on a svara.
-
-## Statistical approach
-
-- **Test**: Mann-Whitney U (two-sided, non-parametric — appropriate for small or non-Gaussian samples).
-- **Correction**: Bonferroni over 12 svaras × 6 metrics = 72 tests (α ≈ 0.0007 at family-wise α = 0.05).
-- **Effect size**: rank-biserial correlation *r*. Guideline: |r| < 0.1 negligible · 0.1–0.3 small · 0.3–0.5 medium · > 0.5 large.
-- **Skewness and kurtosis** are computed from raw pitch samples within ±50 cents of each svara (not from the KDE) to avoid bandwidth-induced smoothing bias.
