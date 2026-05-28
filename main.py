@@ -43,6 +43,7 @@ warnings.filterwarnings("ignore")
 import click
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import gaussian_kde, kruskal, kurtosis, mannwhitneyu, skew
@@ -89,6 +90,30 @@ METRICS = [
     "peak_loc", "offset_cents", "peak_height",
     "peak_width", "skewness", "kurtosis",
 ]
+
+# Svara characters used in symbolic notation (lowercase = natural, uppercase = sharp).
+# Each character maps to a cent position on SVARA_GRID and a natural/sharp flag.
+# Sa (s/S) and Pa (p/P) have no distinct sharp variant; both map to the same position.
+_NOTATION_CHAR_CENTS: dict = {
+    's': (0,    False),
+    'S': (0,    True),
+    'r': (100,  False),
+    'R': (200,  True),
+    'g': (300,  False),
+    'G': (400,  True),
+    'm': (500,  False),
+    'M': (600,  True),
+    'p': (700,  False),
+    'P': (700,  True),
+    'd': (800,  False),
+    'D': (900,  True),
+    'n': (1000, False),
+    'N': (1100, True),
+}
+_NOTATION_SVARA_CHARS = list(_NOTATION_CHAR_CENTS.keys())
+# Colour each SVARA_GRID position: True = sharp, False = natural
+# Sa(0) and Pa(700) are fixed pitches — treated as natural
+_NOTATION_GRID_IS_SHARP = [False, False, True, False, True, False, True, False, False, True, False, True]
 METRIC_LABELS = {
     "peak_loc":     "Peak location (cents from tonic)",
     "offset_cents": "Intonation offset from ET (cents)",
@@ -195,7 +220,11 @@ def compute_fwhm(x: np.ndarray, y: np.ndarray, peak_idx: int) -> float:
     return float(x[right] - x[left])
 
 
-def compute_kde(cents_values: np.ndarray, bw_method: float = KDE_BW):
+def compute_kde(cents_values: np.ndarray, bw_method: float | None = None):
+    n = len(cents_values)
+    if bw_method is None:
+        # More smoothing for sparse data; floor at KDE_BW for large datasets
+        bw_method = max(KDE_BW, 1.0 / n ** 0.5)
     kde = gaussian_kde(cents_values, bw_method=bw_method)
     x = np.linspace(0.0, 1200.0, KDE_N_POINTS)
     y = kde(x)
@@ -223,6 +252,8 @@ def analyse_file(audio_path: str, tonic: float | None = None,
     cents       : ndarray — raw tonic-normalised pitch values (for histogram overlays)
     """
     pitch_track = _load_or_extract_pitch(audio_path)
+    pitch_track = _correct_octave_errors(pitch_track)
+    pitch_track = _interpolate_short_gaps(pitch_track)
     tonic = _load_tonic(audio_path, tonic)
 
     if segment is not None:
@@ -233,6 +264,15 @@ def analyse_file(audio_path: str, tonic: float | None = None,
 
     pitch_vals = pitch_track[:, 1]
     n_total = len(pitch_vals)
+
+    # Build time-series contour (relative time, unfolded cents) for pitch plots.
+    # No modulo: keeps the trajectory continuous across octave boundaries.
+    t_rel = pitch_track[:, 0] - pitch_track[0, 0] if len(pitch_track) else np.array([])
+    all_hz = pitch_track[:, 1]
+    safe_hz = np.where(all_hz > 0, all_hz, np.nan)
+    cents_full = hz_to_cents(safe_hz, tonic)   # unfolded, can span multiple octaves
+    pitch_contour = np.column_stack([t_rel, cents_full]) if len(t_rel) else np.empty((0, 2))
+
     pitch_vals = pitch_vals[pitch_vals > 0]
     n_voiced = len(pitch_vals)
     if n_voiced == 0:
@@ -243,8 +283,9 @@ def analyse_file(audio_path: str, tonic: float | None = None,
     )
 
     cents = hz_to_cents(pitch_vals, tonic) % 1200.0
-    log.debug("Computing KDE (bw=%.3f, %d points)", KDE_BW, KDE_N_POINTS)
-    x, y = compute_kde(cents)
+    bw = max(KDE_BW, 1.0 / n_voiced ** 0.5)
+    log.debug("Computing KDE (bw=%.3f, %d points)", bw, KDE_N_POINTS)
+    x, y = compute_kde(cents, bw_method=bw)
 
     # Find all global KDE peaks via derivative sign change (+ → −)
     dy = np.diff(y)
@@ -300,7 +341,80 @@ def analyse_file(audio_path: str, tonic: float | None = None,
 
     n_present = sum(1 for s in svara_stats.values() if s is not None and s["present"])
     log.info("Svaras present: %d / %d", n_present, len(SVARA_NAMES))
-    return x, y, svara_stats, cents
+    return x, y, svara_stats, cents, pitch_contour
+
+
+# ---------------------------------------------------------------------------
+# Pitch cleaning helpers
+# ---------------------------------------------------------------------------
+
+def _correct_octave_errors(pitch_track: np.ndarray, jump_thresh_cents: float = 900.0) -> np.ndarray:
+    """
+    Correct octave errors using two passes:
+      1. Anchor all voiced frames to within ±0.5 octaves of the global median
+         (handles systematic bias where the tracker locks to the wrong octave).
+      2. Forward pass: any consecutive jump > jump_thresh_cents is treated as
+         an octave error and corrected by the nearest integer number of octaves.
+         Iterated until stable.
+    """
+    track = pitch_track.copy()
+    hz    = track[:, 1].copy()
+    vi    = np.where(hz > 0)[0]
+    if len(vi) < 4:
+        return track
+
+    log2 = np.log2(hz[vi])
+
+    # Pass 1: pull everything to within ±0.5 oct of the median
+    med   = np.median(log2)
+    log2 -= np.round(log2 - med)
+
+    # Pass 2: walk forward, fix remaining jumps > threshold
+    thresh_oct = jump_thresh_cents / 1200.0
+    for _ in range(5):
+        changed = False
+        for k in range(1, len(log2)):
+            diff = log2[k] - log2[k - 1]
+            if abs(diff) > thresh_oct:
+                log2[k] -= round(diff)
+                changed = True
+        if not changed:
+            break
+
+    for k, i in enumerate(vi):
+        track[i, 1] = 2.0 ** log2[k]
+
+    return track
+
+
+def _interpolate_short_gaps(pitch_track: np.ndarray, max_gap_ms: float = 150.0) -> np.ndarray:
+    """
+    Linearly interpolate across interior unvoiced gaps shorter than max_gap_ms.
+    Gaps at the start or end of the track are left unvoiced.
+    """
+    track = pitch_track.copy()
+    hz    = track[:, 1]
+    N     = len(hz)
+    if N < 3:
+        return track
+
+    dt = float(track[1, 0] - track[0, 0]) if N > 1 else 0.0029
+    max_frames = int(max_gap_ms / 1000.0 / dt)
+
+    i = 0
+    while i < N:
+        if hz[i] == 0:
+            j = i
+            while j < N and hz[j] == 0:
+                j += 1
+            gap = j - i
+            if gap <= max_frames and i > 0 and j < N:
+                track[i:j, 1] = np.linspace(hz[i - 1], hz[j], gap + 2)[1:-1]
+            i = j
+        else:
+            i += 1
+
+    return track
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +477,14 @@ def load_manifest(manifest_path: str) -> dict:
     return dict(groups)
 
 
+def _mmss_to_seconds(s: str) -> float:
+    """Convert MM.SS timestamp string to total seconds (e.g. '02.41' → 161.0)."""
+    parts = s.strip().split(".")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    return float(s)
+
+
 def load_annotations(path: str) -> dict:
     """
     Parse an annotations TSV (columns: track, start, end, duration, label).
@@ -376,10 +498,35 @@ def load_annotations(path: str) -> dict:
                 continue
             groups[row["label"].strip()].append({
                 "track": row["track"].strip(),
-                "start": float(row["start"].strip()),
-                "end":   float(row["end"].strip()),
+                "start": _mmss_to_seconds(row["start"].strip()),
+                "end":   _mmss_to_seconds(row["end"].strip()),
             })
     return dict(groups)
+
+
+def load_notations(path: str) -> dict:
+    """
+    Load matched_notations.csv → {track_path: [notation_seq, ...]}
+    Multiple rows with the same track_name are collected as a list.
+    """
+    data: dict = defaultdict(list)
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            data[row["track_name"].strip()].append(row["notation"].strip())
+    return dict(data)
+
+
+def parse_notation_counts(seq: str) -> dict:
+    """
+    Count occurrences of each svara character in a notation string.
+    Only the 14 svara letters (sSrRgGmMpPdDnN) are counted; all other
+    characters (octave dots, ornament markers, barlines, spaces) are ignored.
+    """
+    counts = {c: 0 for c in _NOTATION_SVARA_CHARS}
+    for ch in seq:
+        if ch in counts:
+            counts[ch] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +795,44 @@ def _svara_axis(ax) -> None:
     ax.set_xlim(0, 1200)
 
 
+def _notation_underlay(ax, notation_seqs: list) -> None:
+    """
+    Draw notation svara counts as a semi-transparent bar underlay on ax.
+
+    Bars are placed at SVARA_GRID cent positions and density-normalised so
+    their area ≈ 1 — the same normalisation as the pitch KDE — making both
+    directly comparable on the y-axis.  Natural svaras (lowercase) appear in
+    deep red, sharp svaras (uppercase) in sage green.
+    """
+    if not notation_seqs:
+        return
+
+    # Pool counts across all sequences supplied
+    pooled = {c: 0 for c in _NOTATION_SVARA_CHARS}
+    for seq in notation_seqs:
+        for c, n in parse_notation_counts(seq).items():
+            pooled[c] += n
+
+    total = sum(pooled.values()) or 1
+
+    # Accumulate per SVARA_GRID position (Sa and Pa absorb both variants)
+    grid_counts = np.zeros(len(SVARA_GRID))
+    for char, (cents_pos, _) in _NOTATION_CHAR_CENTS.items():
+        idx = int(np.where(SVARA_GRID == cents_pos)[0][0])
+        grid_counts[idx] += pooled[char]
+
+    # Density normalisation: spacing between grid positions = 100 cents
+    spacing = 100.0
+    density  = grid_counts / (total * spacing)
+    bar_w    = spacing * 0.9
+
+    bar_colors = [_PALETTE[1] if is_sharp else _PALETTE[0]
+                  for is_sharp in _NOTATION_GRID_IS_SHARP]
+
+    ax.bar(SVARA_GRID, density, width=bar_w,
+           color=bar_colors, alpha=0.18, zorder=0, edgecolor="none")
+
+
 def fig_kde_overlay(all_kde: dict, all_cents: dict) -> object:
     """
     Mean ± 1 SD KDE for each group with faint raw-histogram background.
@@ -695,10 +880,13 @@ def fig_kde_overlay(all_kde: dict, all_cents: dict) -> object:
 
 def fig_individual_kde(label: str, recording_name: str, x: np.ndarray,
                        y: np.ndarray, cents: np.ndarray, color: str,
-                       svara_stats: dict | None = None) -> object:
+                       svara_stats: dict | None = None,
+                       notation_seqs: list | None = None) -> object:
     """Single-recording KDE with histogram background and svara peak annotations."""
     _apply_plot_style()
     fig, ax = plt.subplots(figsize=(14, 3.2))
+
+    _notation_underlay(ax, notation_seqs or [])
 
     bin_edges = np.linspace(0, 1200, 121)
     bin_w     = bin_edges[1] - bin_edges[0]
@@ -790,10 +978,12 @@ def fig_boxplots(all_peaks: dict, omnibus: dict) -> dict:
     return figs
 
 
-def fig_combined_histogram(all_kde: dict, all_cents: dict) -> object:
+def fig_combined_histogram(all_kde: dict, all_cents: dict,
+                           notation_by_group: dict | None = None) -> object:
     """
     One subplot per group: pooled KDE (all recordings concatenated) as thick line,
     individual recording KDEs as faint traces, and mean ± 1 SD band.
+    When notation_by_group is provided, notation svara density is underlaid.
     """
     _apply_plot_style()
     labels = sorted(all_kde.keys())
@@ -807,6 +997,8 @@ def fig_combined_histogram(all_kde: dict, all_cents: dict) -> object:
         c = colors[label]
         cents_list = all_cents[label]
         kde_list   = all_kde[label]
+
+        _notation_underlay(ax, (notation_by_group or {}).get(label, []))
 
         # Pooled KDE from concatenated cents
         pooled = np.concatenate(cents_list)
@@ -845,6 +1037,70 @@ def fig_combined_histogram(all_kde: dict, all_cents: dict) -> object:
 
     axes[-1].set_xlabel("Cents from tonic")
     plt.tight_layout()
+    return fig
+
+
+def fig_pitch_contour(label: str, name: str, pitch_seg: np.ndarray, color: str) -> object:
+    """Pitch-over-time plot with svara y-axis + rotated histogram sharing that axis."""
+    _apply_plot_style()
+    fig, (ax_pitch, ax_hist) = plt.subplots(
+        1, 2, figsize=(16, 4),
+        gridspec_kw={"width_ratios": [3, 1], "wspace": 0.04},
+        sharey=True,
+    )
+
+    t = pitch_seg[:, 0]
+    c = pitch_seg[:, 1]
+    voiced = c[~np.isnan(c)]
+
+    # --- Dynamic y-axis: cover voiced pitch range with generous padding -------
+    if len(voiced):
+        pad    = 150.0
+        y_lo   = voiced.min() - pad
+        y_hi   = voiced.max() + pad
+        # Snap to nearest 1200-cent boundary so svara labels align cleanly
+        oct_lo = int(np.floor(y_lo / 1200.0))
+        oct_hi = int(np.ceil(y_hi / 1200.0))
+    else:
+        oct_lo, oct_hi = 0, 1
+        y_lo, y_hi = 0.0, 1200.0
+
+    # --- Svara reference lines across all relevant octaves --------------------
+    y_ticks, y_labels = [], []
+    for n in range(oct_lo, oct_hi + 1):
+        for svara_cents, svara_name in zip(SVARA_GRID, SVARA_NAMES):
+            pos = svara_cents + n * 1200.0
+            ax_pitch.axhline(pos, color="#cccccc", lw=0.7, ls="--", alpha=0.7, zorder=0)
+            if y_lo <= pos <= y_hi:
+                y_ticks.append(pos)
+                y_labels.append(svara_name)
+
+    # --- Pitch contour --------------------------------------------------------
+    ax_pitch.plot(t, c, color=color, lw=1.4, alpha=0.9)
+    ax_pitch.set_ylim(y_lo, y_hi)
+    ax_pitch.set_yticks(y_ticks)
+    ax_pitch.set_yticklabels(y_labels, fontsize=9)
+    ax_pitch.set_xlabel("Time (s)", fontsize=9)
+    ax_pitch.set_ylabel("Cents from tonic", fontsize=9)
+    ax_pitch.set_title(name, fontsize=10, pad=4)
+    ax_pitch.tick_params(labelsize=8)
+
+    # --- Rotated histogram shared y-axis --------------------------------------
+    if len(voiced) >= 2:
+        bin_edges = np.linspace(y_lo, y_hi, 61)
+        counts, _ = np.histogram(voiced, bins=bin_edges)
+        bin_ctrs  = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_w     = bin_edges[1] - bin_edges[0]
+        ax_hist.barh(bin_ctrs, counts, height=bin_w * 0.9, color=color, alpha=0.55)
+    for n in range(oct_lo, oct_hi + 1):
+        for svara_cents in SVARA_GRID:
+            ax_hist.axhline(svara_cents + n * 1200.0,
+                            color="#cccccc", lw=0.7, ls="--", alpha=0.7, zorder=0)
+    ax_hist.set_xlabel("Count", fontsize=9)
+    ax_hist.tick_params(labelsize=8)
+    ax_hist.tick_params(axis="y", left=False, labelleft=False)
+
+    plt.tight_layout(pad=0.6)
     return fig
 
 
@@ -958,6 +1214,8 @@ details summary { cursor: pointer; color: #2d5a8a; font-size: 0.88rem; }
 .ind-group > summary { font-size: 0.92rem; color: #444; padding: 0.3rem 0; }
 .ind-kde { margin: 0.8rem 0; }
 .ind-kde img { width: 100%; max-width: 1000px; display: block; }
+.contour-grid { display: flex; flex-direction: column; gap: 0.8rem; padding: 0.6rem 0; }
+.pitch-contour img { width: 100%; height: auto; display: block; }
 """
 
 
@@ -992,13 +1250,30 @@ def build_report(
     n_tests_pairwise: int,
     alpha: float = 0.05,
     hypothesis_results: list | None = None,
+    notations_data: dict | None = None,
+    pitch_segs: dict | None = None,   # {label: [ndarray(T,2), ...]} — only in annotation mode
     sections_only: bool = False,
 ) -> str:
     labels = sorted(all_peaks.keys())
     pairs  = list(combinations(labels, 2))
+    colors = _group_colors(labels)
 
     corrected_alpha_omni = alpha / n_tests_omnibus
     corrected_alpha_pair = alpha / n_tests_pairwise if n_tests_pairwise else float("nan")
+
+    # ---- Build notation lookups used by figure functions -------------------
+    notation_by_stem: dict = {}
+    notation_by_group: dict = {}
+    if notations_data:
+        for full_path, seqs in notations_data.items():
+            stem = os.path.splitext(os.path.basename(full_path))[0]
+            notation_by_stem[stem] = seqs
+        for label in labels:
+            group_seqs = []
+            for disp_name in all_paths[label]:
+                group_seqs.extend(notation_by_stem.get(disp_name.split(" [")[0], []))
+            if group_seqs:
+                notation_by_group[label] = group_seqs
 
     # ---- Figures -----------------------------------------------------------
     ov_fig  = fig_kde_overlay(all_kde, all_cents)
@@ -1012,7 +1287,8 @@ def build_report(
     for f in bp_figs.values():
         plt.close(f)
 
-    ch_fig  = fig_combined_histogram(all_kde, all_cents)
+    ch_fig  = fig_combined_histogram(all_kde, all_cents,
+                                     notation_by_group=notation_by_group or None)
     ch_b64  = _b64(ch_fig);  plt.close(ch_fig)
 
     # ---- Helpers for tables ------------------------------------------------
@@ -1329,16 +1605,17 @@ def build_report(
         )
 
     # ---- Section 9: Individual performance histograms ----------------------
-    colors = _group_colors(labels)
     ind_blocks = []
     for label in labels:
         recording_imgs = []
         for path, (x, y), cents, rec_peaks in zip(
             all_paths[label], all_kde[label], all_cents[label], all_peaks[label]
         ):
-            name = os.path.basename(path)
-            fig  = fig_individual_kde(label, name, x, y, cents, colors[label],
-                                      svara_stats=rec_peaks)
+            name  = os.path.basename(path)
+            stem  = path.split(" [")[0]
+            seqs  = notation_by_stem.get(stem, [])
+            fig   = fig_individual_kde(label, name, x, y, cents, colors[label],
+                                       svara_stats=rec_peaks, notation_seqs=seqs)
             recording_imgs.append(
                 f"<div class='ind-kde'>{_img(_b64(fig))}</div>"
             )
@@ -1351,29 +1628,67 @@ def build_report(
         )
         ind_blocks.append(group_html)
 
+    _notation_note = (
+        " Where symbolic notation is available for a recording, density-normalised "
+        "svara counts are underlaid in red (natural) and green (sharp)."
+        if notations_data else ""
+    )
+
     sec9 = _section(
         "<details class='sec-collapsible'>"
         "<summary><h2 style='display:inline'>9. Individual performance histograms</h2></summary>"
-        "<p>KDE and pitch histogram for each recording, grouped by group. "
-        "Expand a group to scroll through its recordings.</p>"
+        f"<p>KDE and pitch histogram for each recording, grouped by group. "
+        f"Expand a group to scroll through its recordings.{_notation_note}</p>"
         + "".join(ind_blocks)
         + "</details>"
     )
 
     sec10 = _section(
         "<h2>10. Combined pitch histograms per group</h2>"
-        "<p>Each panel shows the pooled KDE computed from all recordings in the group "
+        f"<p>Each panel shows the pooled KDE computed from all recordings in the group "
         "(thick line), overlaid on the mean&nbsp;±&nbsp;1&nbsp;SD band from individual "
         "recording KDEs (shading) and faint individual traces. "
-        "Bar chart shows the pooled pitch histogram.</p>"
+        f"Bar chart shows the pooled pitch histogram.{_notation_note}</p>"
         + _img(ch_b64)
     )
+
+    # ---- Section 11: Pattern pitch contours (annotation mode only) ----------
+    sec11 = None
+    if pitch_segs:
+        contour_blocks = []
+        for label in labels:
+            segs  = pitch_segs.get(label, [])
+            paths = all_paths.get(label, [])
+            imgs  = []
+            for name, seg in zip(paths, segs):
+                fig = fig_pitch_contour(label, name, seg, colors[label])
+                imgs.append(f"<div class='pitch-contour'>{_img(_b64(fig))}</div>")
+                plt.close(fig)
+            if imgs:
+                contour_blocks.append(
+                    f"<details class='ind-group' open>"
+                    f"<summary><strong>{label}</strong> — {len(imgs)} occurrence(s)</summary>"
+                    f"<div class='contour-grid'>{''.join(imgs)}</div>"
+                    f"</details>"
+                )
+        if contour_blocks:
+            sec11 = _section(
+                "<details class='sec-collapsible' open>"
+                "<summary><h2 style='display:inline'>11. Pitch contours per occurrence</h2></summary>"
+                "<p>Pitch trajectory (cents from tonic, time-aligned to segment start) "
+                "for each annotated occurrence, grouped by performer group. "
+                "Horizontal lines mark canonical svara positions.</p>"
+                + "".join(contour_blocks)
+                + "</details>"
+            )
 
     sections = [sec1, sec2, sec3, sec4, sec5, sec6, sec7]
     if sec8:
         sections.append(sec8)
     sections.append(sec9)
     sections.append(sec10)
+    if sec11:
+        sections.append(sec11)
 
     inner = "\n".join(sections)
 
@@ -1391,12 +1706,14 @@ def build_report(
     ])
 
 
-def _build_tabbed_html(tab_contents: dict) -> str:
+def _build_tabbed_html(tab_contents: dict, tab_counts: dict | None = None) -> str:
     """
     Wrap per-annotation-label section HTML in a single-page tabbed layout.
     tab_contents: {label: inner_sections_html}
+    tab_counts:   {label: n_occurrences}  — shown in brackets on each tab
     """
     labels = sorted(tab_contents.keys())
+    tab_counts = tab_counts or {}
 
     _TAB_CSS = """
 .tab-bar {
@@ -1419,7 +1736,11 @@ def _build_tabbed_html(tab_contents: dict) -> str:
 
     buttons = "".join(
         f'<button class="tab-btn{" active" if i == 0 else ""}" '
-        f'onclick="showTab(this,{i})">{lbl}</button>'
+        f'onclick="showTab(this,{i})">'
+        f'{lbl}'
+        + (f' <span style="font-size:0.78em;color:#888;font-weight:400">({tab_counts[lbl]})</span>'
+           if lbl in tab_counts else "")
+        + '</button>'
         for i, lbl in enumerate(labels)
     )
 
@@ -1589,8 +1910,13 @@ def extract(ctx, audio_paths):
               type=click.Path(exists=True),
               help="TSV annotations file; restricts analysis to labelled segments, "
                    "grouping by annotation label instead of manifest group.")
+@click.option("--notations", "notations_path", default=None,
+              type=click.Path(exists=True),
+              help="CSV of matched symbolic notations (columns: track_name, notation). "
+                   "Adds a svara-distribution comparison section. "
+                   "Cannot be combined with --annotations.")
 @click.pass_context
-def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path):
+def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path, notations_path):
     """
     Full pipeline: process all groups in MANIFEST, compare them, write HTML report.
 
@@ -1599,6 +1925,12 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
     Use --groups to restrict analysis to a subset of the manifest groups.
     Requires at least 2 groups.
     """
+    if notations_path and annotations_path:
+        raise click.UsageError(
+            "--notations cannot be combined with --annotations. "
+            "Notation comparison is only available for full-performance analysis."
+        )
+
     t_start = time.time()
     log.info("Loading manifest: %s", manifest)
     all_groups = load_manifest(manifest)
@@ -1660,6 +1992,12 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
         hypotheses = load_hypotheses(hypotheses_path)
         log.info("%d hypothesis/hypotheses loaded", len(hypotheses))
 
+    notations_data = None
+    if notations_path:
+        log.info("Loading notations: %s", notations_path)
+        notations_data = load_notations(notations_path)
+        log.info("Notations loaded for %d track(s)", len(notations_data))
+
     def _process_selected(run_selected: dict, ann_label: str | None) -> str | None:
         """Run the full analysis for one selected dict. Returns sections HTML."""
         if len(run_selected) < 2:
@@ -1672,14 +2010,15 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
         for lbl, entries in sorted(run_selected.items()):
             log.info("  %-20s  %d segment(s)", lbl, len(entries))
 
-        all_paths:  dict = {}
-        all_kde:    dict = {}
-        all_cents:  dict = {}
-        all_peaks:  dict = {}
+        all_paths:       dict = {}
+        all_kde:         dict = {}
+        all_cents:       dict = {}
+        all_peaks:       dict = {}
+        all_pitch_segs:  dict = {}
 
         for label, entries in sorted(run_selected.items()):
             log.info("--- Processing group '%s' (%d file(s)) ---", label, len(entries))
-            kde_list, cents_list, peaks_list, display_names = [], [], [], []
+            kde_list, cents_list, peaks_list, display_names, pitch_seg_list = [], [], [], [], []
             for i, entry in enumerate(entries, 1):
                 seg = entry.get("segment")
                 seg_str = f" [{seg[0]:.2f}–{seg[1]:.2f}s]" if seg else ""
@@ -1687,7 +2026,7 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
                 display = f"{stem}{seg_str}"
                 log.info("[%d/%d] %s", i, len(entries), display)
                 try:
-                    x, y, stats, cents = analyse_file(
+                    x, y, stats, cents, pitch_contour = analyse_file(
                         entry["path"], tonic=entry["tonic"], segment=seg
                     )
                 except Exception as exc:
@@ -1697,11 +2036,23 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
                 cents_list.append(cents)
                 peaks_list.append(stats)
                 display_names.append(display)
-            all_paths[label]  = display_names
-            all_kde[label]    = kde_list
-            all_cents[label]  = cents_list
-            all_peaks[label]  = peaks_list
+                pitch_seg_list.append(pitch_contour)
             log.info("Group '%s' done (%d/%d succeeded)", label, len(peaks_list), len(entries))
+            if not kde_list:
+                log.warning("Group '%s' has no valid files — skipping.", label)
+                continue
+            all_paths[label]       = display_names
+            all_kde[label]         = kde_list
+            all_cents[label]       = cents_list
+            all_peaks[label]       = peaks_list
+            all_pitch_segs[label]  = pitch_seg_list
+
+        if len(all_peaks) < 2:
+            log.warning(
+                "After processing, only %d group(s) have valid data (need ≥ 2) — skipping.",
+                len(all_peaks),
+            )
+            return None
 
         log.info("Running statistical comparison...")
         omnibus, pairwise, n_peaks_omni, n_peaks_pair, n_tests_omni, n_tests_pair = \
@@ -1733,12 +2084,15 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
             n_tests_omni, n_tests_pair,
             alpha=alpha,
             hypothesis_results=hypothesis_results,
+            notations_data=notations_data,
+            pitch_segs=all_pitch_segs if annotations_path else None,
             sections_only=annotations_path is not None,
         )
 
     if annotations_path:
         # One tab per distinct annotation label in a single output file
         tab_contents = {}
+        tab_counts:  dict = {}
         for ann_label in sorted(annotations.keys()):
             log.info("=== Pattern '%s' ===", ann_label)
             run_selected = {
@@ -1749,12 +2103,13 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path)
             sections_html = _process_selected(run_selected, ann_label)
             if sections_html is not None:
                 tab_contents[ann_label] = sections_html
+                tab_counts[ann_label]   = sum(len(v) for v in run_selected.values())
 
         if not tab_contents:
             raise click.UsageError("No annotation labels produced a valid analysis.")
 
         log.info("Building tabbed report → %s", output)
-        html = _build_tabbed_html(tab_contents)
+        html = _build_tabbed_html(tab_contents, tab_counts)
     else:
         log.info("Building report → %s", output)
         html = _process_selected(selected, ann_label=None)
@@ -1816,7 +2171,7 @@ def features(ctx, manifest, output, groups):
             path = entry["path"]
             log.info("[%d/%d] %s", i, len(entries), path)
             try:
-                _, _, svara_stats, _ = analyse_file(path, tonic=entry["tonic"])
+                _, _, svara_stats, _, _ = analyse_file(path, tonic=entry["tonic"])
             except Exception as exc:
                 log.warning("Skipping %s — %s", path, exc)
                 row = {"filename": path, "group": label}
