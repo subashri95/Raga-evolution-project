@@ -31,6 +31,7 @@ import os
 import re
 import time
 import warnings
+import wave as _wave
 from collections import defaultdict
 from itertools import combinations
 
@@ -478,10 +479,20 @@ def load_manifest(manifest_path: str) -> dict:
 
 
 def _mmss_to_seconds(s: str) -> float:
-    """Convert MM.SS timestamp string to total seconds (e.g. '02.41' → 161.0)."""
+    """
+    Parse a timestamp to seconds.
+    Handles two formats:
+      - MM.SS (e.g. '02.41' → 161.0, '05.21' → 321.0) — only when the
+        decimal part is a valid seconds value (0–59).
+      - Decimal seconds (e.g. '0.96' → 0.96, '4.65' → 4.65) — used when
+        the decimal part ≥ 60, which cannot represent a seconds value.
+    """
     parts = s.strip().split(".")
     if len(parts) == 2:
-        return int(parts[0]) * 60 + int(parts[1])
+        ss = int(parts[1])
+        if ss < 60:
+            return int(parts[0]) * 60 + ss
+        # decimal part ≥ 60 → not MM.SS, treat whole value as float seconds
     return float(s)
 
 
@@ -785,6 +796,123 @@ def _b64(fig) -> str:
 
 def _img(b64: str) -> str:
     return f'<img src="data:image/png;base64,{b64}" />'
+
+
+def _synthesize_contour_audio(pitch_contour: np.ndarray, tonic_hz: float,
+                               sr: int = 22050) -> str:
+    """
+    Synthesize audio from a pitch contour.
+    Melody: sine wave following the pitch curve (prominent).
+    Drone: triangle wave at tonic (softer, audibly distinct timbre).
+    Returns base64-encoded WAV string, or '' on failure.
+    """
+    if len(pitch_contour) < 2 or tonic_hz <= 0:
+        return ""
+    t0 = float(pitch_contour[0, 0])
+    t1 = float(pitch_contour[-1, 0])
+    duration = t1 - t0
+    if duration <= 0.0:
+        return ""
+
+    n = int(duration * sr) + 1
+    t_axis = np.linspace(0.0, duration, n, dtype=np.float32)
+
+    cents_interp = np.interp(t_axis,
+                             pitch_contour[:, 0] - t0,
+                             pitch_contour[:, 1],
+                             left=np.nan, right=np.nan).astype(np.float32)
+    voiced = np.isfinite(cents_interp)
+    freq_hz = np.where(voiced, tonic_hz * (2.0 ** (cents_interp / 1200.0)), 0.0).astype(np.float32)
+
+    # Melody: sine via cumulative phase (vectorised)
+    phase_inc = np.where(voiced, 2.0 * np.pi * freq_hz / sr, 0.0).astype(np.float32)
+    phases = np.cumsum(phase_inc).astype(np.float32)
+    melody = np.where(voiced, np.sin(phases), 0.0).astype(np.float32)
+
+    # Tonic drone: triangle wave (richer timbre, clearly distinct from pure sine)
+    tonic_phase = (2.0 * np.pi * tonic_hz * t_axis).astype(np.float32)
+    tonic_drone = ((2.0 / np.pi) * np.arcsin(np.clip(np.sin(tonic_phase), -1.0, 1.0))).astype(np.float32)
+
+    mix = (0.72 * melody + 0.22 * tonic_drone).astype(np.float32)
+
+    fade = min(int(0.03 * sr), n // 10)
+    if fade > 0:
+        mix[:fade]  *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+        mix[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+
+    peak = float(np.max(np.abs(mix)))
+    if peak > 1e-6:
+        mix *= float(0.9 / peak)
+
+    buf = io.BytesIO()
+    with _wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes((mix * 32767).astype(np.int16).tobytes())
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
+def _load_audio_segment_b64(audio_path: str, start_sec: float, end_sec: float,
+                             target_sr: int = 22050) -> str:
+    """
+    Load a segment of any audio format (MP3, WAV, MOV, FLAC, …) via ffmpeg,
+    normalise and return a base64-encoded 16-bit mono WAV string.
+    Returns '' on failure.
+    """
+    import subprocess
+
+    if not os.path.exists(audio_path):
+        log.debug("Audio file not found: %s", audio_path)
+        return ""
+
+    duration = end_sec - start_sec if end_sec > 0 else None
+
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", str(start_sec),
+        ]
+        if duration is not None and duration > 0:
+            cmd += ["-t", str(duration)]
+        cmd += [
+            "-i", audio_path,
+            "-f", "s16le",       # raw signed 16-bit little-endian PCM
+            "-ar", str(target_sr),
+            "-ac", "1",          # mono
+            "pipe:1",
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0 or len(result.stdout) < 2:
+            log.debug("ffmpeg failed for %s: %s", audio_path,
+                      result.stderr.decode(errors="replace")[:200])
+            return ""
+
+        data = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        if len(data) == 0:
+            return ""
+
+        peak = float(np.max(np.abs(data)))
+        if peak > 1e-6:
+            data *= float(0.9 / peak)
+
+        fade = min(int(0.02 * target_sr), len(data) // 10)
+        if fade > 0:
+            data[:fade]  *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            data[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+
+        buf = io.BytesIO()
+        with _wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(target_sr)
+            wf.writeframes((data * 32767).astype(np.int16).tobytes())
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode()
+    except Exception as exc:
+        log.debug("Could not embed audio segment from %s: %s", audio_path, exc)
+        return ""
 
 
 def _svara_axis(ax) -> None:
@@ -1216,6 +1344,9 @@ details summary { cursor: pointer; color: #2d5a8a; font-size: 0.88rem; }
 .ind-kde img { width: 100%; max-width: 1000px; display: block; }
 .contour-grid { display: flex; flex-direction: column; gap: 0.8rem; padding: 0.6rem 0; }
 .pitch-contour img { width: 100%; height: auto; display: block; }
+.audio-row { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 12px 0; }
+.audio-row audio { width: 100%; height: 36px; display: block; }
+.audio-label { font-size: 0.75rem; color: #777; font-style: italic; margin-top: 6px; }
 """
 
 
@@ -1251,7 +1382,9 @@ def build_report(
     alpha: float = 0.05,
     hypothesis_results: list | None = None,
     notations_data: dict | None = None,
-    pitch_segs: dict | None = None,   # {label: [ndarray(T,2), ...]} — only in annotation mode
+    pitch_segs: dict | None = None,    # {label: [ndarray(T,2), ...]} — only in annotation mode
+    pitch_tonics: dict | None = None,  # {label: [tonic_hz, ...]}
+    audio_segs: dict | None = None,    # {label: [(path, start_sec, end_sec), ...]}
     sections_only: bool = False,
 ) -> str:
     labels = sorted(all_peaks.keys())
@@ -1657,13 +1790,47 @@ def build_report(
     if pitch_segs:
         contour_blocks = []
         for label in labels:
-            segs  = pitch_segs.get(label, [])
-            paths = all_paths.get(label, [])
+            segs       = pitch_segs.get(label, [])
+            paths      = all_paths.get(label, [])
+            tonics     = (pitch_tonics or {}).get(label, [None] * len(segs))
+            aud_segs   = (audio_segs or {}).get(label, [None] * len(segs))
             imgs  = []
-            for name, seg in zip(paths, segs):
+            for name, seg, tonic_hz, aud in zip(paths, segs, tonics, aud_segs):
                 fig = fig_pitch_contour(label, name, seg, colors[label])
-                imgs.append(f"<div class='pitch-contour'>{_img(_b64(fig))}</div>")
+                img_html = _img(_b64(fig))
                 plt.close(fig)
+
+                # Synthesized audio: sine melody + triangle tonic drone
+                synth_b64 = _synthesize_contour_audio(seg, tonic_hz or 0.0)
+                synth_audio = (
+                    f'<audio controls><source src="data:audio/wav;base64,{synth_b64}" '
+                    f'type="audio/wav"></audio>'
+                ) if synth_b64 else ""
+
+                # Original recording audio for this segment
+                orig_b64 = ""
+                if aud is not None:
+                    a_path, a_start, a_end = aud
+                    orig_b64 = _load_audio_segment_b64(a_path, a_start, a_end)
+                orig_audio = (
+                    f'<audio controls><source src="data:audio/wav;base64,{orig_b64}" '
+                    f'type="audio/wav"></audio>'
+                ) if orig_b64 else ""
+
+                audio_row = ""
+                if synth_audio or orig_audio:
+                    parts = []
+                    if orig_audio:
+                        parts.append(
+                            f'<span class="audio-label">Original&nbsp;audio</span>{orig_audio}'
+                        )
+                    if synth_audio:
+                        parts.append(
+                            f'<span class="audio-label">Synthesized&nbsp;pitch</span>{synth_audio}'
+                        )
+                    audio_row = f'<div class="audio-row">{"".join(parts)}</div>'
+
+                imgs.append(f"<div class='pitch-contour'>{img_html}{audio_row}</div>")
             if imgs:
                 contour_blocks.append(
                     f"<details class='ind-group' open>"
@@ -2015,10 +2182,13 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path,
         all_cents:       dict = {}
         all_peaks:       dict = {}
         all_pitch_segs:  dict = {}
+        all_tonics:      dict = {}
+        all_audio_segs:  dict = {}
 
         for label, entries in sorted(run_selected.items()):
             log.info("--- Processing group '%s' (%d file(s)) ---", label, len(entries))
             kde_list, cents_list, peaks_list, display_names, pitch_seg_list = [], [], [], [], []
+            tonic_list, audio_seg_list = [], []
             for i, entry in enumerate(entries, 1):
                 seg = entry.get("segment")
                 seg_str = f" [{seg[0]:.2f}–{seg[1]:.2f}s]" if seg else ""
@@ -2029,6 +2199,7 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path,
                     x, y, stats, cents, pitch_contour = analyse_file(
                         entry["path"], tonic=entry["tonic"], segment=seg
                     )
+                    tonic_hz = _load_tonic(entry["path"], entry["tonic"])
                 except Exception as exc:
                     log.warning("Skipping %s — %s", display, exc)
                     continue
@@ -2037,6 +2208,12 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path,
                 peaks_list.append(stats)
                 display_names.append(display)
                 pitch_seg_list.append(pitch_contour)
+                tonic_list.append(tonic_hz)
+                audio_seg_list.append((
+                    entry["path"],
+                    seg[0] if seg else 0.0,
+                    seg[1] if seg else -1.0,
+                ))
             log.info("Group '%s' done (%d/%d succeeded)", label, len(peaks_list), len(entries))
             if not kde_list:
                 log.warning("Group '%s' has no valid files — skipping.", label)
@@ -2046,6 +2223,8 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path,
             all_cents[label]       = cents_list
             all_peaks[label]       = peaks_list
             all_pitch_segs[label]  = pitch_seg_list
+            all_tonics[label]      = tonic_list
+            all_audio_segs[label]  = audio_seg_list
 
         if len(all_peaks) < 2:
             log.warning(
@@ -2086,6 +2265,8 @@ def run(ctx, manifest, groups, output, alpha, hypotheses_path, annotations_path,
             hypothesis_results=hypothesis_results,
             notations_data=notations_data,
             pitch_segs=all_pitch_segs if annotations_path else None,
+            pitch_tonics=all_tonics if annotations_path else None,
+            audio_segs=all_audio_segs if annotations_path else None,
             sections_only=annotations_path is not None,
         )
 
