@@ -32,6 +32,16 @@ audio/groupB/recording_02.wav,GroupB,233.08
 
 The `tonic` column is optional. If it is absent or a cell is empty, the pipeline falls back to a `_tonic.txt` sidecar file at the same path as the audio (containing a single float in Hz). Having the tonic in the manifest is generally preferable as it keeps all metadata in one place.
 
+## TF-IDF Pattern Report
+
+To generate the TF-IDF report of melodic patterns across Bhairavi groups:
+
+```bash
+python3 tfidf_patterns.py
+```
+
+Reads from `Annotations/annotations-4.csv` and writes `tfidf_report.html`. Open that file in any browser — it is fully self-contained.
+
 ## Commands
 
 ### Extract pitch tracks (optional pre-cache step)
